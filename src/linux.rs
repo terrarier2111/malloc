@@ -49,6 +49,8 @@ pub(crate) fn alloc(size: usize) -> *mut u8 {
     let chunk_start = unsafe { alloc_chunk_start(alloc_ptr) };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size, true);
+    chunk.set_first(true);
+    chunk.set_last(true);
     chunk.into_content_start()
 }
 
@@ -63,8 +65,23 @@ pub(crate) fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     let alloc_ptr = map_memory(full_size);
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size);
-    let desired_chunk_start = unsafe { align_unaligned_ptr_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, page_size).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
-    todo!()
+    let mut desired_chunk_start = unsafe { align_unaligned_ptr_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, page_size).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
+    if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
+        desired_chunk_start = unsafe { desired_chunk_start.add(size) };
+    }
+    let mut chunk = ChunkRef::new_start(desired_chunk_start);
+    chunk.setup(size, false);
+    let mut first_chunk = ChunkRef::new_start(unsafe { alloc_ptr.add(ALLOC_METADATA_SIZE_ONE_SIDE) });
+    let first_chunk_size = chunk as usize - alloc_ptr as usize - ALLOC_METADATA_SIZE_ONE_SIDE;
+    first_chunk.setup(first_chunk_size, true);
+    first_chunk.set_free(true);
+    let last_chunk_start = chunk.into_end(size).into_raw();
+    let mut last_chunk = ChunkRef::new_start(last_chunk_start);
+    let last_chunk_size = alloc_ptr as usize + full_size - first_chunk_size - ALLOC_METADATA_SIZE;
+    last_chunk.setup(last_chunk_size, false);
+    last_chunk.set_free(true);
+
+    chunk.into_content_start()
 }
 
 #[inline]
@@ -74,18 +91,25 @@ pub(crate) fn dealloc(ptr: *mut u8) {
         // FIXME: determine size of alloc.
     }
     let chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE) });
-    let size = chunk.read_size();
+    let chunk_size = chunk.read_size();
     if chunk.is_first() {
         // FIXME: try merging with right chunk (if this isn't the only chunk)
         let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
         // check if we are the only allocation
-        if size + ALLOC_METADATA_SIZE == alloc_size {
+        // ensure that there is enough size for an additional chunk so we can read its metadata
+        if chunk_size + ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE >= alloc_size {
             unmap_memory(alloc.into_raw(), alloc_size);
             return;
         }
-
+        let right_chunk = chunk.into_end(chunk_size);
+        let overall_size = chunk_size + ALLOC_METADATA_SIZE + right_chunk.read_size();
+        if overall_size + ALLOC_METADATA_SIZE == alloc_size {
+            unmap_memory(alloc.into_raw(), alloc_size);
+            return;
+        }
     }
+
 
 }
 
@@ -234,11 +258,23 @@ mod alloc_ref {
 mod chunk_ref {
     use crate::linux::CHUNK_METADATA_SIZE;
 
-    const FIRST_CHUNK_FLAG: usize = 1 << (usize::BITS - 1);
+    // FIXME: assume that we have alignment >= 2
+    const FIRST_CHUNK_FLAG: usize = 1 << 0;
+    const LAST_CHUNK_FLAG: usize = 1 << 1;
+    const FREE_CHUNK_FLAG: usize = 1 << 2;
 
     /// `START` indicates whether the stored reference is a reference to the chunk's start or end.
     #[derive(Copy, Clone)]
     pub(crate) struct ChunkRef<const START: bool>(*mut u8);
+
+    impl<const START: bool> ChunkRef<START> {
+
+        #[inline]
+        pub(crate) fn into_raw(self) -> *mut u8 {
+            self.0
+        }
+
+    }
 
     impl ChunkRef<true> {
 
@@ -295,8 +331,45 @@ mod chunk_ref {
         }
 
         #[inline]
+        pub(crate) fn set_first(&mut self, first: bool) {
+            if first {
+                self.write_size_raw(self.read_size_raw() | FIRST_CHUNK_FLAG);
+            } else {
+                self.write_size_raw(self.read_size_raw() & !FIRST_CHUNK_FLAG);
+            }
+        }
+
+        #[inline]
         pub(crate) fn is_first(&self) -> bool {
             self.read_size() & FIRST_CHUNK_FLAG != 0
+        }
+
+        #[inline]
+        pub(crate) fn set_last(&mut self, last: bool) {
+            if last {
+                self.write_size_raw(self.read_size_raw() | LAST_CHUNK_FLAG);
+            } else {
+                self.write_size_raw(self.read_size_raw() & !LAST_CHUNK_FLAG);
+            }
+        }
+
+        #[inline]
+        pub(crate) fn is_last(&self) -> bool {
+            self.read_size() & LAST_CHUNK_FLAG != 0
+        }
+
+        #[inline]
+        pub(crate) fn set_free(&mut self, free: bool) {
+            if free {
+                self.write_size_raw(self.read_size_raw() | FREE_CHUNK_FLAG);
+            } else {
+                self.write_size_raw(self.read_size_raw() & !FREE_CHUNK_FLAG);
+            }
+        }
+
+        #[inline]
+        pub(crate) fn is_free(&self) -> bool {
+            self.read_size() & FREE_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -307,11 +380,6 @@ mod chunk_ref {
         #[inline]
         pub(crate) fn into_content_start(self) -> *mut u8 {
             unsafe { self.0.add(CHUNK_METADATA_SIZE) }
-        }
-
-        #[inline]
-        pub(crate) fn into_raw(self) -> *mut u8 {
-            self.0
         }
 
     }
