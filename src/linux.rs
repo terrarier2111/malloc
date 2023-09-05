@@ -69,8 +69,24 @@ pub(crate) fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 #[inline]
 pub(crate) fn dealloc(ptr: *mut u8) {
-    let size = unsafe { read_chunk_size(ptr) };
-    unmap_memory(ptr, size);
+    let page_size = get_page_size();
+    if ptr % page_size == 0 {
+        // FIXME: determine size of alloc.
+    }
+    let chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE) });
+    let size = chunk.read_size();
+    if chunk.is_first() {
+        // FIXME: try merging with right chunk (if this isn't the only chunk)
+        let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
+        let alloc_size = alloc.read_size();
+        // check if we are the only allocation
+        if size + ALLOC_METADATA_SIZE == alloc_size {
+            unmap_memory(alloc.into_raw(), alloc_size);
+            return;
+        }
+
+    }
+
 }
 
 #[inline]
@@ -94,10 +110,11 @@ fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
     unsafe { libc::mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
 }
 
-const ALLOC_METADATA_SIZE: usize = size_of::<usize>() * 2 * 2;
-const CHUNK_METADATA_SIZE: usize = size_of::<usize>() * 2;
+const ALLOC_METADATA_SIZE: usize = ALLOC_METADATA_SIZE_ONE_SIDE * 2;
+const ALLOC_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>() * 2;
+const CHUNK_METADATA_SIZE: usize = CHUNK_METADATA_SIZE_ONE_SIDE * 2;
+const CHUNK_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
 const ALLOC_FULL_INITIAL_METADATA_SIZE: usize = ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE;
-const ALLOC_METADATA_SIZE_ONE_SIDE: usize = ALLOC_METADATA_SIZE / 2;
 const ALLOC_FULL_INITIAL_METADATA_PADDING: usize = MIN_ALIGN - (ALLOC_FULL_INITIAL_METADATA_SIZE % MIN_ALIGN);
 
 #[inline]
@@ -110,6 +127,15 @@ mod alloc_ref {
 
     #[derive(Copy, Clone)]
     pub(crate) struct AllocRef<const START: bool>(*mut u8);
+
+    impl<const START: bool> AllocRef<START> {
+
+        #[inline]
+        pub(crate) fn into_raw(self) -> *mut u8 {
+            self.0
+        }
+
+    }
 
     impl AllocRef<true> {
 
@@ -281,6 +307,11 @@ mod chunk_ref {
         #[inline]
         pub(crate) fn into_content_start(self) -> *mut u8 {
             unsafe { self.0.add(CHUNK_METADATA_SIZE) }
+        }
+
+        #[inline]
+        pub(crate) fn into_raw(self) -> *mut u8 {
+            self.0
         }
 
     }
