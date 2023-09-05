@@ -1,4 +1,5 @@
 mod linux;
+mod util;
 
 #[no_mangle]
 pub fn alloc(size: usize) -> *mut u8 {
