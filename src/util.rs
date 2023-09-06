@@ -5,3 +5,9 @@ pub(crate) unsafe fn align_unaligned_ptr_to<const REGION_SIZE: usize>(ptr: *mut 
     let region_start = ptr.add(len - (additional + REGION_SIZE));
     region_start
 }
+
+#[inline]
+pub(crate) fn round_up_to(val: usize, to: usize) -> usize {
+    let diff = val % to;
+    val + (to - diff)
+}
