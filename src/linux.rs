@@ -82,19 +82,13 @@ pub(crate) fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 pub(crate) fn dealloc(ptr: *mut u8) {
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE) });
     let chunk_size = chunk.read_size();
+
     if chunk.is_first() {
         if chunk.is_last() {
             unreachable!();
         }
-        // FIXME: try merging with right chunk (if this isn't the only chunk)
         let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
-        // check if we are the only allocation
-        // ensure that there is enough size for an additional chunk so we can read its metadata
-        if chunk_size + ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE >= alloc_size {
-            unmap_memory(alloc.into_raw(), alloc_size);
-            return;
-        }
         let right_chunk = chunk.into_end(chunk_size);
         if !right_chunk.is_free() {
             // we can't merge with any other chunk, so we can just mark ourselves as free
@@ -109,9 +103,9 @@ pub(crate) fn dealloc(ptr: *mut u8) {
         // FIXME: merge both chunks
     } else if chunk.is_last() {
         // FIXME: try merging with left chunk
-        let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
+        let alloc = AllocRef::new_end(unsafe { chunk.into_end(chunk_size).into_raw().add(ALLOC_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
-        let left_chunk = ChunkRef::new_end(alloc.into_raw());
+        let left_chunk = ChunkRef::new_end(unsafe { alloc.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         if !left_chunk.is_free() {
             // we can't merge with any other chunk, so we can just mark ourselves as free
             chunk.set_free(true);
@@ -119,15 +113,13 @@ pub(crate) fn dealloc(ptr: *mut u8) {
         }
         let overall_size = chunk_size + ALLOC_METADATA_SIZE + left_chunk.read_size();
         if overall_size + ALLOC_METADATA_SIZE == alloc_size {
-            unmap_memory(alloc.into_raw(), alloc_size);
+            unmap_memory(alloc.into_start(alloc_size).into_raw(), alloc_size);
             return;
         }
         // FIXME: merge both chunks
     } else {
 
     }
-
-
 }
 
 #[inline]
