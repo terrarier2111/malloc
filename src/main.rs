@@ -1,17 +1,14 @@
-#![no_std]
-
 #![feature(core_intrinsics)]
 
-use core::intrinsics::abort;
+use allocator::{alloc, dealloc};
 
 mod linux;
 mod util;
 
 fn main() {
-
-}
-
-#[panic_handler]
-fn panic_handler() {
-    abort();
+    println!("main!");
+    let alloced = alloc(20);
+    println!("errno: {}", errno::errno());
+    println!("alloc: {:?}", alloced);
+    dealloc(alloced);
 }

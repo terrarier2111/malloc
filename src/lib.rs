@@ -1,11 +1,11 @@
-#![no_std]
+// #![no_std]
 
 #![feature(core_intrinsics)]
 
 mod linux;
 mod util;
 
-#[no_mangle]
+// #[no_mangle]
 pub fn alloc(size: usize) -> *mut u8 {
     if cfg!(target_os = "linux") {
         linux::alloc(size)
@@ -14,7 +14,7 @@ pub fn alloc(size: usize) -> *mut u8 {
     }
 }
 
-#[no_mangle]
+// #[no_mangle]
 pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     if cfg!(target_os = "linux") {
         linux::alloc_aligned(size, align)
@@ -23,7 +23,7 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     }
 }
 
-#[no_mangle]
+// #[no_mangle]
 pub fn dealloc(ptr: *mut u8) {
     if ptr.is_null() {
         // this is a noop
@@ -36,7 +36,7 @@ pub fn dealloc(ptr: *mut u8) {
     }
 }
 
-#[no_mangle]
+// #[no_mangle]
 pub fn realloc(ptr: *mut u8, old_size: usize, new_size: usize, new_align: usize) -> *mut u8 {
     if cfg!(target_os = "linux") {
         linux::realloc(ptr, old_size, new_size, new_align)

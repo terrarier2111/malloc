@@ -3,7 +3,8 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MREMAP_MAYMOVE, munmap, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
+use std::mem::align_of;
+use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, mremap, MREMAP_MAYMOVE, munmap, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
 use crate::util::{align_unaligned_ptr_to, round_up_to};
@@ -36,21 +37,33 @@ fn get_page_size() -> usize {
 
 /// returns memory aligned to ptr size
 #[inline]
-pub(crate) fn alloc(size: usize) -> *mut u8 {
+pub fn alloc(size: usize) -> *mut u8 {
+    let size = round_up_to(size, align_of::<usize>());
+    println!("pre page size {}", size);
     let page_size = get_page_size();
+    println!("page size: {}", page_size);
+    println!("unaligned size: {}", size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING);
 
     let full_size = round_up_to(size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING, page_size);
 
+    println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
+    println!("alloced!");
+    if alloc_ptr.is_null() {
+        return alloc_ptr;
+    }
+    if alloc_ptr as usize % 8 != 0 {
+        panic!("error!");
+    }
+    println!("checked alignment");
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size + CHUNK_METADATA_SIZE);
     let chunk_start = unsafe { alloc_chunk_start(alloc_ptr) };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
     if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING + CHUNK_METADATA_SIZE {
-        // FIXME: setup other chunk!
         let mut last_chunk = ChunkRef::new_start(chunk.into_end(size + CHUNK_METADATA_SIZE).into_raw());
-        last_chunk.setup(full_size - (size + CHUNK_METADATA_SIZE), false, true);
+        last_chunk.setup(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE), false, true);
     } else {
         chunk.set_last(true);
     }
@@ -58,10 +71,14 @@ pub(crate) fn alloc(size: usize) -> *mut u8 {
 }
 
 #[inline]
-pub(crate) fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
+pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
+    let size = round_up_to(size, align_of::<usize>());
     let page_size = get_page_size();
     let full_size = round_up_to(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
     let alloc_ptr = map_memory(full_size);
+    if alloc_ptr.is_null() {
+        return alloc_ptr;
+    }
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size);
     let mut desired_chunk_start = unsafe { align_unaligned_ptr_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
@@ -84,7 +101,7 @@ pub(crate) fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 }
 
 #[inline]
-pub(crate) fn dealloc(ptr: *mut u8) {
+pub fn dealloc(ptr: *mut u8) {
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE) });
     let chunk_size = chunk.read_size();
 
@@ -134,10 +151,11 @@ pub(crate) fn dealloc(ptr: *mut u8) {
 }
 
 #[inline]
-pub(crate) fn realloc(ptr: *mut u8, old_size: usize, new_size: usize, _new_align: usize) -> *mut u8 {
+pub fn realloc(ptr: *mut u8, old_size: usize, new_size: usize, _new_align: usize) -> *mut u8 {
     remap_memory(ptr, old_size, new_size)
 }
 
+#[cfg(not(miri))]
 #[inline]
 fn map_memory(size: usize) -> *mut u8 {
     const MMAP_SYSCALL_ID: usize = 9;
@@ -150,17 +168,23 @@ fn map_memory(size: usize) -> *mut u8 {
             in("rdi") null_mut::<c_void>(),
             in("rsi") size as size_t,
             in("rdx") PROT_READ | PROT_WRITE,
-            in("r10") MAP_ANON,
+            in("r10") MAP_ANON | MAP_PRIVATE,
             in("r8") -1 as c_int,
             in("r9") 0 as off64_t,
-            inlateout("rax") MMAP_SYSCALL_ID => ptr
+            inlateout("rax") MMAP_SYSCALL_ID => ptr,
+            lateout("rdx") _,
         );
     }
     ptr
 }
 
+#[cfg(miri)]
+fn map_memory(size: usize) -> *mut u8 {
+    unsafe { libc::mmap(null_mut(), size as size_t, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1 as c_int, 0 as off64_t) }.cast::<u8>() // FIXME: can we handle return value?
+}
+
 fn unmap_memory(ptr: *mut u8, size: usize) {
-    let result = unsafe { libc::munmap(ptr.cast::<c_void>(), size as size_t) };
+    let result = unsafe { munmap(ptr.cast::<c_void>(), size as size_t) };
     if result != 0 {
         // we can't handle this error properly, so just abort the process
         core::intrinsics::abort();
@@ -168,7 +192,7 @@ fn unmap_memory(ptr: *mut u8, size: usize) {
 }
 
 fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
-    unsafe { libc::mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
+    unsafe { mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
 }
 
 const ALLOC_METADATA_SIZE: usize = ALLOC_METADATA_SIZE_ONE_SIDE * 2;
@@ -176,7 +200,14 @@ const ALLOC_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>() * 2;
 const CHUNK_METADATA_SIZE: usize = CHUNK_METADATA_SIZE_ONE_SIDE * 2;
 const CHUNK_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
 const ALLOC_FULL_INITIAL_METADATA_SIZE: usize = ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE;
-const ALLOC_FULL_INITIAL_METADATA_PADDING: usize = MIN_ALIGN - (ALLOC_FULL_INITIAL_METADATA_SIZE % MIN_ALIGN);
+const ALLOC_FULL_INITIAL_METADATA_PADDING: usize = {
+    let diff = ALLOC_FULL_INITIAL_METADATA_SIZE % MIN_ALIGN;
+    if diff == 0 {
+        0
+    } else {
+        MIN_ALIGN - diff
+    }
+};
 
 #[inline]
 unsafe fn alloc_chunk_start(alloc: *mut u8) -> *mut u8 {
@@ -323,6 +354,10 @@ mod chunk_ref {
         #[inline]
         pub(crate) fn setup(&mut self, size: usize, first_chunk: bool, last_chunk: bool) {
             self.setup_own(size, first_chunk, last_chunk);
+            if self.into_end(size).0 as usize % 8 != 0 {
+                panic!("unaligned: {} size: {}", self.into_end(size).0 as usize % 8, size % 8);
+            }
+            println!("checked alignment end!");
             self.into_end(size).setup_own(size, first_chunk, last_chunk);
         }
 
@@ -453,11 +488,6 @@ mod chunk_ref {
         #[inline]
         fn read_size_raw(&self) -> usize {
             unsafe { *self.0.cast::<usize>().sub(1) }
-        }
-
-        #[inline]
-        pub(crate) fn write_size<const FIRST_CHUNK: bool>(&mut self, size: usize) {
-
         }
 
         /// this doesn't modify the FIRST_CHUNK flag
