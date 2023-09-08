@@ -1,3 +1,7 @@
+#![no_std]
+
+#![feature(core_intrinsics)]
+
 mod linux;
 mod util;
 
