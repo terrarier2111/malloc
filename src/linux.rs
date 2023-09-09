@@ -48,12 +48,9 @@ pub fn alloc(size: usize) -> *mut u8 {
 
     println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
-    println!("alloced!");
+    println!("alloced {:?}", alloc_ptr);
     if alloc_ptr.is_null() {
         return alloc_ptr;
-    }
-    if alloc_ptr as usize % 8 != 0 {
-        panic!("error!");
     }
     println!("checked alignment");
     let mut alloc = AllocRef::new_start(alloc_ptr);
@@ -64,6 +61,7 @@ pub fn alloc(size: usize) -> *mut u8 {
     if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING + CHUNK_METADATA_SIZE {
         let mut last_chunk = ChunkRef::new_start(chunk.into_end(size + CHUNK_METADATA_SIZE).into_raw());
         last_chunk.setup(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE), false, true);
+        last_chunk.set_free(true);
     } else {
         chunk.set_last(true);
     }
@@ -102,10 +100,13 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 #[inline]
 pub fn dealloc(ptr: *mut u8) {
-    let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE) });
+    println!("start dealloc {:?}", ptr);
+    let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
+    println!("chunk size: {} chunk {:?}", chunk_size, unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
 
     if chunk.is_first() {
+        println!("first chunk!");
         if chunk.is_last() {
             unreachable!();
         }
@@ -127,6 +128,7 @@ pub fn dealloc(ptr: *mut u8) {
         chunk.update_size(overall_size); // FIXME: just update left metadata
         return;
     } else if chunk.is_last() {
+        println!("last chunk!");
         // FIXME: try merging with left chunk
         let alloc = AllocRef::new_end(unsafe { chunk.into_end(chunk_size).into_raw().add(ALLOC_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
@@ -146,7 +148,7 @@ pub fn dealloc(ptr: *mut u8) {
         chunk.update_size(overall_size); // FIXME: just update right metadata
         return;
     } else {
-
+        println!("weird chunk!");
     }
 }
 
@@ -184,6 +186,7 @@ fn map_memory(size: usize) -> *mut u8 {
 }
 
 fn unmap_memory(ptr: *mut u8, size: usize) {
+    println!("unmapped!");
     let result = unsafe { munmap(ptr.cast::<c_void>(), size as size_t) };
     if result != 0 {
         // we can't handle this error properly, so just abort the process
@@ -324,7 +327,7 @@ mod alloc_ref {
 }
 
 mod chunk_ref {
-    use crate::linux::CHUNK_METADATA_SIZE;
+    use crate::linux::{CHUNK_METADATA_SIZE, CHUNK_METADATA_SIZE_ONE_SIDE};
 
     // FIXME: assume that we have alignment >= 2
     const FIRST_CHUNK_FLAG: usize = 1 << 0;
@@ -357,7 +360,7 @@ mod chunk_ref {
             if self.into_end(size).0 as usize % 8 != 0 {
                 panic!("unaligned: {} size: {}", self.into_end(size).0 as usize % 8, size % 8);
             }
-            println!("checked alignment end!");
+            println!("checked alignment end {:?}", self.0);
             self.into_end(size).setup_own(size, first_chunk, last_chunk);
         }
 
@@ -447,7 +450,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn into_content_start(self) -> *mut u8 {
-            unsafe { self.0.add(CHUNK_METADATA_SIZE) }
+            unsafe { self.0.add(CHUNK_METADATA_SIZE_ONE_SIDE) }
         }
 
     }
