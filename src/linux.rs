@@ -103,7 +103,7 @@ pub fn dealloc(ptr: *mut u8) {
     println!("start dealloc {:?}", ptr);
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
-    println!("chunk size: {} chunk {:?}", chunk_size, unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
+    println!("chunk size: {} chunk {:?} free {}", chunk_size, unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) }, chunk.is_last());
 
     if chunk.is_first() {
         println!("first chunk!");
@@ -327,7 +327,7 @@ mod alloc_ref {
 }
 
 mod chunk_ref {
-    use crate::linux::{CHUNK_METADATA_SIZE, CHUNK_METADATA_SIZE_ONE_SIDE};
+    use crate::linux::CHUNK_METADATA_SIZE_ONE_SIDE;
 
     // FIXME: assume that we have alignment >= 2
     const FIRST_CHUNK_FLAG: usize = 1 << 0;
@@ -412,7 +412,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_first(&self) -> bool {
-            self.read_size() & FIRST_CHUNK_FLAG != 0
+            self.read_size_raw() & FIRST_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -426,7 +426,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_last(&self) -> bool {
-            self.read_size() & LAST_CHUNK_FLAG != 0
+            self.read_size_raw() & LAST_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -440,7 +440,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_free(&self) -> bool {
-            self.read_size() & FREE_CHUNK_FLAG != 0
+            self.read_size_raw() & FREE_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -516,7 +516,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_first(&self) -> bool {
-            self.read_size() & FIRST_CHUNK_FLAG != 0
+            self.read_size_raw() & FIRST_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -530,7 +530,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_last(&self) -> bool {
-            self.read_size() & LAST_CHUNK_FLAG != 0
+            self.read_size_raw() & LAST_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -544,7 +544,7 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn is_free(&self) -> bool {
-            self.read_size() & FREE_CHUNK_FLAG != 0
+            self.read_size_raw() & FREE_CHUNK_FLAG != 0
         }
 
         #[inline]
