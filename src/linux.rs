@@ -42,9 +42,9 @@ pub fn alloc(size: usize) -> *mut u8 {
     println!("pre page size {}", size);
     let page_size = get_page_size();
     println!("page size: {}", page_size);
-    println!("unaligned size: {}", size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING);
+    println!("unaligned size: {}", size + ALLOC_FULL_INITIAL_METADATA_SIZE);
 
-    let full_size = round_up_to(size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING, page_size);
+    let full_size = round_up_to(size + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
 
     println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
@@ -112,14 +112,16 @@ pub fn dealloc(ptr: *mut u8) {
         }
         let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
-        let mut right_chunk = chunk.into_end(chunk_size);
+        let mut right_chunk = ChunkRef::new_start(chunk.into_end(chunk_size).into_raw());
         if !right_chunk.is_free() {
+            println!("only free!");
             // we can't merge with any other chunk, so we can just mark ourselves as free
             chunk.set_free(true);
             return;
         }
         let overall_size = chunk_size + right_chunk.read_size();
-        if overall_size + ALLOC_METADATA_SIZE == alloc_size {
+        if right_chunk.is_last() {
+            println!("unmap {:?}", alloc.into_raw());
             unmap_memory(alloc.into_raw(), alloc_size);
             return;
         }
@@ -214,7 +216,7 @@ const ALLOC_FULL_INITIAL_METADATA_PADDING: usize = {
 
 #[inline]
 unsafe fn alloc_chunk_start(alloc: *mut u8) -> *mut u8 {
-    alloc.add(ALLOC_METADATA_SIZE)
+    alloc.add(ALLOC_METADATA_SIZE_ONE_SIDE)
 }
 
 
