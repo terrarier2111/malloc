@@ -187,8 +187,8 @@ fn map_memory(size: usize) -> *mut u8 {
     unsafe { libc::mmap(null_mut(), size as size_t, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1 as c_int, 0 as off64_t) }.cast::<u8>() // FIXME: can we handle return value?
 }
 
+#[cfg(miri)]
 fn unmap_memory(ptr: *mut u8, size: usize) {
-    println!("unmapped!");
     let result = unsafe { munmap(ptr.cast::<c_void>(), size as size_t) };
     if result != 0 {
         // we can't handle this error properly, so just abort the process
@@ -196,8 +196,50 @@ fn unmap_memory(ptr: *mut u8, size: usize) {
     }
 }
 
+#[cfg(not(miri))]
+#[inline]
+fn unmap_memory(ptr: *mut u8, size: usize) {
+    const MUNMAP_SYSCALL_ID: usize = 11;
+
+    let result: c_int;
+
+    unsafe {
+        asm!(
+        "syscall",
+        in("rax") MUNMAP_SYSCALL_ID,
+        in("rdi") ptr,
+        in("rsi") size as size_t,
+        lateout("rax") result,
+        );
+    }
+
+    if result != 0 {
+        // we can't handle this error properly, so just abort the process
+        core::intrinsics::abort();
+    }
+}
+
+#[cfg(miri)]
 fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
     unsafe { mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
+}
+
+#[cfg(not(miri))]
+fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
+    const MREMAP_SYSCALL_ID: usize = 25;
+    let res_ptr;
+
+    unsafe {
+        asm!(
+        "syscall",
+        inlateout("rax") MREMAP_SYSCALL_ID => res_ptr,
+        in("rdi") ptr,
+        in("rsi") old_size,
+        in("rdx") new_size,
+        );
+    }
+
+    res_ptr
 }
 
 const ALLOC_METADATA_SIZE: usize = ALLOC_METADATA_SIZE_ONE_SIDE * 2;
