@@ -18,10 +18,14 @@ static PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
 static FREE_CHUNK_ROOT: AtomicPtr<()> = AtomicPtr::new(null_mut()); // this is the root for the implicit RB-tree
 
 /// `chunk_start` indicates the start of the chunk (including metadata)
-/// `size` indicates the number of bytes available
+/// `size` indicates the chunk size in bytes
 fn push_free_chunk(chunk_start: *mut u8, size: usize) {
     let curr_start_chunk = FREE_CHUNK_ROOT.load(Ordering::Acquire).cast::<u8>();
-    
+    if curr_start_chunk.is_null() {
+        FREE_CHUNK_ROOT.store(chunk_start.cast::<_>(), Ordering::Release);
+        return;
+    }
+
 }
 
 #[inline]
@@ -30,6 +34,12 @@ fn get_page_size() -> usize {
     if cached != NOT_PRESENT {
         return cached;
     }
+    setup_page_size()
+}
+
+#[cold]
+#[inline(never)]
+fn setup_page_size() -> usize {
     let resolved = unsafe { sysconf(_SC_PAGESIZE) as usize };
     PAGE_SIZE.store(resolved, Ordering::Relaxed);
     resolved
@@ -39,10 +49,7 @@ fn get_page_size() -> usize {
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
     let size = round_up_to(size, align_of::<usize>());
-    println!("pre page size {}", size);
     let page_size = get_page_size();
-    println!("page size: {}", page_size);
-    println!("unaligned size: {}", size + ALLOC_FULL_INITIAL_METADATA_SIZE);
 
     let full_size = round_up_to(size + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
 
@@ -52,7 +59,6 @@ pub fn alloc(size: usize) -> *mut u8 {
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
-    println!("checked alignment");
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size + CHUNK_METADATA_SIZE);
     let chunk_start = unsafe { alloc_chunk_start(alloc_ptr) };
@@ -594,6 +600,61 @@ mod chunk_ref {
         #[inline]
         pub(crate) fn into_start(self, size: usize) -> ChunkRef<true> {
             ChunkRef(unsafe { self.0.sub(size) })
+        }
+
+    }
+
+}
+
+mod implicit_rb_tree {
+    use std::mem::align_of;
+    use std::ptr::{NonNull, null_mut};
+
+    const RED: usize = 0 << 0;
+    const BLACK: usize = 1 << 0;
+
+    const COLOR_MASK: usize = 1 << 0;
+
+    const PTR_MASK: usize = !COLOR_MASK;
+
+    pub struct ImplicitRbTree<T> {
+        root: Option<ImplicitRbTreeNode<T>>,
+    }
+
+    pub struct ImplicitRbTreeNode<T> {
+        parent: *mut T,
+        left: *mut T,
+        right: *mut T,
+    }
+
+    impl<T> ImplicitRbTreeNode<T> {
+
+        #[inline]
+        pub unsafe fn new(parent: *mut T) -> Self {
+            if align_of::<T>() < 2 {
+                panic!("Only types with alignment >= 2 are supported in implicit rb trees.");
+            }
+            Self {
+                // we don't have to set any flags as RED has no `1` bits.
+                parent,
+                left: null_mut(),
+                right: null_mut(),
+            }
+        }
+
+        #[inline]
+        fn parent_ptr(&self) -> *mut T {
+            self.parent.mask(PTR_MASK)
+        }
+
+        #[inline]
+        pub(crate) fn is_red(&self) -> bool {
+            (self.0 as usize) & COLOR_MASK == RED
+        }
+
+        #[inline]
+        pub(crate) fn is_black(&self) -> bool {
+            (self.0 as usize) & COLOR_MASK == BLACK
         }
 
     }
