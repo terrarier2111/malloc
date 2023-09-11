@@ -607,7 +607,7 @@ mod chunk_ref {
 }
 
 mod implicit_rb_tree {
-    use std::mem::align_of;
+    use std::mem::{align_of, size_of};
     use std::ptr::{NonNull, null_mut};
 
     const RED: usize = 0 << 0;
@@ -617,28 +617,72 @@ mod implicit_rb_tree {
 
     const PTR_MASK: usize = !COLOR_MASK;
 
-    pub struct ImplicitRbTree<T> {
-        root: Option<ImplicitRbTreeNode<T>>,
+    #[derive(Copy, Clone, PartialEq)]
+    #[repr(usize)]
+    pub enum Color {
+        Red = RED,
+        Black = BLACK,
     }
 
-    pub struct ImplicitRbTreeNode<T> {
-        parent: *mut T,
-        left: *mut T,
-        right: *mut T,
+    #[repr(C)]
+    pub struct ImplicitRbTree {
+        root: Option<ImplicitRbTreeNodeRef>,
     }
 
-    impl<T> ImplicitRbTreeNode<T> {
+    #[derive(Copy, Clone)]
+    pub struct ImplicitRbTreeNodeRef(*mut ());
+
+    impl ImplicitRbTreeNodeRef {
 
         #[inline]
-        pub unsafe fn new(parent: *mut T) -> Self {
-            if align_of::<T>() < 2 {
-                panic!("Only types with alignment >= 2 are supported in implicit rb trees.");
-            }
+        pub fn new(ptr: *mut ()) -> Self {
+            Self(ptr)
+        }
+
+        #[inline]
+        pub fn new_with_color(ptr: *mut (), color: Color) -> Self {
+            Self(ptr.map_addr(|ptr| ptr | color as usize))
+        }
+
+        #[inline]
+        pub(crate) unsafe fn tree_node<'a>(self) -> Option<&'a ImplicitRbTreeNode> {
+            unsafe { self.0.cast::<ImplicitRbTreeNode>().as_ref() }
+        }
+
+        #[inline]
+        pub(crate) unsafe fn data_ptr(self) -> *mut u8 {
+            unsafe { self.0.cast::<u8>().add(size_of::<ImplicitRbTreeNode>()) }
+        }
+
+    }
+
+    #[inline]
+    pub unsafe fn create_tree_node(addr: *mut (), parent: ImplicitRbTreeNodeRef, color: Color) -> ImplicitRbTreeNodeRef {
+        unsafe { addr.cast::<ImplicitRbTreeNode>().write(ImplicitRbTreeNode {
+            parent: ImplicitRbTreeNodeRef::new_with_color(parent.0, color),
+            left: ImplicitRbTreeNodeRef(null_mut()),
+            right: ImplicitRbTreeNodeRef(null_mut()),
+        }); }
+        ImplicitRbTreeNodeRef(addr)
+    }
+
+    #[repr(align(2))]
+    #[repr(C)]
+    pub struct ImplicitRbTreeNode {
+        parent: ImplicitRbTreeNodeRef,
+        left: ImplicitRbTreeNodeRef,
+        right: ImplicitRbTreeNodeRef,
+    }
+
+    impl ImplicitRbTreeNode {
+
+        #[inline]
+        unsafe fn new(parent: ImplicitRbTreeNodeRef) -> Self {
             Self {
                 // we don't have to set any flags as RED has no `1` bits.
                 parent,
-                left: null_mut(),
-                right: null_mut(),
+                left: ImplicitRbTreeNodeRef(null_mut()),
+                right: ImplicitRbTreeNodeRef(null_mut()),
             }
         }
 

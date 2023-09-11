@@ -1,6 +1,7 @@
 // #![no_std]
 
 #![feature(core_intrinsics)]
+#![feature(strict_provenance)]
 
 mod linux;
 mod util;
