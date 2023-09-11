@@ -1,5 +1,6 @@
 #![feature(core_intrinsics)]
 #![feature(ptr_mask)]
+#![feature(strict_provenance)]
 
 use allocator::{alloc, dealloc};
 

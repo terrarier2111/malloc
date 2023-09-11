@@ -4,7 +4,7 @@ use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::mem::align_of;
-use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, mremap, MREMAP_MAYMOVE, munmap, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
+use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
 use crate::util::{align_unaligned_ptr_to, round_up_to};
@@ -607,8 +607,8 @@ mod chunk_ref {
 }
 
 mod implicit_rb_tree {
-    use std::mem::{align_of, size_of};
-    use std::ptr::{NonNull, null_mut};
+    use std::mem::size_of;
+    use std::ptr::null_mut;
 
     const RED: usize = 0 << 0;
     const BLACK: usize = 1 << 0;
@@ -640,11 +640,6 @@ mod implicit_rb_tree {
         }
 
         #[inline]
-        pub fn new_with_color(ptr: *mut (), color: Color) -> Self {
-            Self(ptr.map_addr(|ptr| ptr | color as usize))
-        }
-
-        #[inline]
         pub(crate) unsafe fn tree_node<'a>(self) -> Option<&'a ImplicitRbTreeNode> {
             unsafe { self.0.cast::<ImplicitRbTreeNode>().as_ref() }
         }
@@ -659,7 +654,7 @@ mod implicit_rb_tree {
     #[inline]
     pub unsafe fn create_tree_node(addr: *mut (), parent: ImplicitRbTreeNodeRef, color: Color) -> ImplicitRbTreeNodeRef {
         unsafe { addr.cast::<ImplicitRbTreeNode>().write(ImplicitRbTreeNode {
-            parent: ImplicitRbTreeNodeRef::new_with_color(parent.0, color),
+            parent: parent.0.map_addr(|addr| addr | color as usize),
             left: ImplicitRbTreeNodeRef(null_mut()),
             right: ImplicitRbTreeNodeRef(null_mut()),
         }); }
@@ -669,7 +664,7 @@ mod implicit_rb_tree {
     #[repr(align(2))]
     #[repr(C)]
     pub struct ImplicitRbTreeNode {
-        parent: ImplicitRbTreeNodeRef,
+        parent: *mut (),
         left: ImplicitRbTreeNodeRef,
         right: ImplicitRbTreeNodeRef,
     }
@@ -677,28 +672,50 @@ mod implicit_rb_tree {
     impl ImplicitRbTreeNode {
 
         #[inline]
-        unsafe fn new(parent: ImplicitRbTreeNodeRef) -> Self {
+        unsafe fn new_red(parent: ImplicitRbTreeNodeRef) -> Self {
             Self {
-                // we don't have to set any flags as RED has no `1` bits.
-                parent,
+                parent: parent.0.map_addr(|addr| addr | RED),
                 left: ImplicitRbTreeNodeRef(null_mut()),
                 right: ImplicitRbTreeNodeRef(null_mut()),
             }
         }
 
         #[inline]
-        fn parent_ptr(&self) -> *mut T {
-            self.parent.mask(PTR_MASK)
+        unsafe fn new_black(parent: ImplicitRbTreeNodeRef) -> Self {
+            Self {
+                parent: parent.0.map_addr(|addr| addr | BLACK),
+                left: ImplicitRbTreeNodeRef(null_mut()),
+                right: ImplicitRbTreeNodeRef(null_mut()),
+            }
+        }
+
+        #[inline]
+        fn parent_ptr(&self) -> ImplicitRbTreeNodeRef {
+            ImplicitRbTreeNodeRef(self.parent.0.mask(PTR_MASK))
         }
 
         #[inline]
         pub(crate) fn is_red(&self) -> bool {
-            (self.0 as usize) & COLOR_MASK == RED
+            (self.parent.0 as usize) & COLOR_MASK == RED
         }
 
         #[inline]
         pub(crate) fn is_black(&self) -> bool {
-            (self.0 as usize) & COLOR_MASK == BLACK
+            (self.parent.0 as usize) & COLOR_MASK == BLACK
+        }
+
+        #[inline]
+        fn sibling(&self) -> Option<ImplicitRbTreeNodeRef> {
+            if self.parent_ptr().is_null() {
+                return None;
+            }
+            let right = unsafe { self.parent_ptr().tree_node().unwrap_unchecked().right };
+            if right.0.cast_const().cast::<ImplicitRbTreeNode>() == self as *const ImplicitRbTreeNode {
+                let left = unsafe { self.parent_ptr().tree_node().unwrap_unchecked().right };
+                return Some(left);
+            }
+            debug_assert_eq!(unsafe { self.parent_ptr().tree_node().unwrap_unchecked().left }, self as *const ImplicitRbTreeNode);
+            Some(right)
         }
 
     }
