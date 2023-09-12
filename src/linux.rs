@@ -628,6 +628,25 @@ mod implicit_rb_tree {
     pub struct ImplicitRbTree {
         root: Option<ImplicitRbTreeNodeRef>,
     }
+    
+    impl ImplicitRbTree {
+        
+        #[inline]
+        pub const fn new() -> Self {
+            Self {
+                root: None,
+            }
+        }
+
+        pub fn insert(&mut self, key: usize, addr: *mut ()) {
+            if self.root.is_none() {
+                self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, ImplicitRbTreeNodeRef::new(null_mut())) });
+                return;
+            }
+
+        }
+        
+    }
 
     #[derive(Copy, Clone)]
     pub struct ImplicitRbTreeNodeRef(*mut ());
@@ -652,11 +671,12 @@ mod implicit_rb_tree {
     }
 
     #[inline]
-    pub unsafe fn create_tree_node(addr: *mut (), parent: ImplicitRbTreeNodeRef, color: Color) -> ImplicitRbTreeNodeRef {
+    unsafe fn create_tree_node(key: usize, addr: *mut (), color: Color, parent: ImplicitRbTreeNodeRef) -> ImplicitRbTreeNodeRef {
         unsafe { addr.cast::<ImplicitRbTreeNode>().write(ImplicitRbTreeNode {
             parent: parent.0.map_addr(|addr| addr | color as usize),
             left: ImplicitRbTreeNodeRef(null_mut()),
             right: ImplicitRbTreeNodeRef(null_mut()),
+            key,
         }); }
         ImplicitRbTreeNodeRef(addr)
     }
@@ -667,25 +687,28 @@ mod implicit_rb_tree {
         parent: *mut (),
         left: ImplicitRbTreeNodeRef,
         right: ImplicitRbTreeNodeRef,
+        key: usize,
     }
 
     impl ImplicitRbTreeNode {
 
         #[inline]
-        unsafe fn new_red(parent: ImplicitRbTreeNodeRef) -> Self {
+        unsafe fn new_red(parent: ImplicitRbTreeNodeRef, key: usize) -> Self {
             Self {
                 parent: parent.0.map_addr(|addr| addr | RED),
                 left: ImplicitRbTreeNodeRef(null_mut()),
                 right: ImplicitRbTreeNodeRef(null_mut()),
+                key,
             }
         }
 
         #[inline]
-        unsafe fn new_black(parent: ImplicitRbTreeNodeRef) -> Self {
+        unsafe fn new_black(parent: ImplicitRbTreeNodeRef, key: usize) -> Self {
             Self {
                 parent: parent.0.map_addr(|addr| addr | BLACK),
                 left: ImplicitRbTreeNodeRef(null_mut()),
                 right: ImplicitRbTreeNodeRef(null_mut()),
+                key,
             }
         }
 
