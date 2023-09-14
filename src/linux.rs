@@ -643,7 +643,15 @@ mod implicit_rb_tree {
                 self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, ImplicitRbTreeNodeRef::new(null_mut())) });
                 return;
             }
+            unsafe { self.root.unwrap().tree_node().unwrap_unchecked() }.insert(key, addr);
+        }
 
+        pub fn remove(&mut self, key: usize) -> *mut () {
+            let root = unsafe { self.root.as_mut().unwrap().tree_node_mut().unwrap_unchecked() };
+            if !root.has_children() {
+                return unsafe { self.root.take().unwrap_unchecked().0 }; // FIXME: should we return the data ptr instead?
+            }
+            root.remove(key)
         }
         
     }
@@ -661,6 +669,11 @@ mod implicit_rb_tree {
         #[inline]
         pub(crate) unsafe fn tree_node<'a>(self) -> Option<&'a ImplicitRbTreeNode> {
             unsafe { self.0.cast::<ImplicitRbTreeNode>().as_ref() }
+        }
+
+        #[inline]
+        pub(crate) unsafe fn tree_node_mut<'a>(self) -> Option<&'a mut ImplicitRbTreeNode> {
+            unsafe { self.0.cast::<ImplicitRbTreeNode>().as_mut() }
         }
 
         #[inline]
@@ -739,6 +752,37 @@ mod implicit_rb_tree {
             }
             debug_assert_eq!(unsafe { self.parent_ptr().tree_node().unwrap_unchecked().left }, self as *const ImplicitRbTreeNode);
             Some(right)
+        }
+
+        #[inline]
+        fn has_children(&self) -> bool {
+            !(self.left.0.is_null() && self.right.0.is_null())
+        }
+
+        fn insert(&mut self, key: usize, addr: *mut ()) {
+            if self.key < key {
+                if self.right.0.is_null() {
+                    self.right = unsafe { create_tree_node(key, addr, Color::Red, ImplicitRbTreeNodeRef((&self as *const ImplicitRbTreeNode).cast_mut().cast::<()>())) };
+                    // FIXME: fixup new node (recolor and rotate)
+                    return;
+                }
+                unsafe { self.right.tree_node_mut().unwrap_unchecked().insert(key, addr); }
+                return;
+            }
+            if self.left.0.is_null() {
+                self.left = unsafe { create_tree_node(key, addr, Color::Red, ImplicitRbTreeNodeRef((&self as *const ImplicitRbTreeNode).cast_mut().cast::<()>())) };
+                // FIXME: fixup new node (recolor and rotate)
+                return;
+            }
+            unsafe { self.left.tree_node_mut().unwrap_unchecked().insert(key, addr); }
+        }
+
+        fn remove(&mut self, key: usize) -> *mut () {
+            if self.key < key {// FIXME: check if key matches with right or left!
+                unsafe { self.right.tree_node_mut() }.unwrap().remove(key)
+            } else {
+                unsafe { self.left.tree_node_mut() }.unwrap().remove(key)
+            }
         }
 
     }
