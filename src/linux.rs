@@ -617,6 +617,8 @@ mod implicit_rb_tree {
 
     const PTR_MASK: usize = !COLOR_MASK;
 
+    pub const NODE_SIZE: usize = size_of::<ImplicitRbTreeNode>();
+
     #[derive(Copy, Clone, PartialEq)]
     #[repr(usize)]
     pub enum Color {
@@ -652,6 +654,13 @@ mod implicit_rb_tree {
                 return unsafe { self.root.take().unwrap_unchecked().0 }; // FIXME: should we return the data ptr instead?
             }
             root.remove(key)
+        }
+
+        pub fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
+            match &self.root {
+                None => None,
+                Some(node) => unsafe { node.tree_node() }.unwrap().find_approx_ge(approx_key),
+            }
         }
         
     }
@@ -779,10 +788,28 @@ mod implicit_rb_tree {
 
         fn remove(&mut self, key: usize) -> *mut () {
             if self.key < key {// FIXME: check if key matches with right or left!
-                unsafe { self.right.tree_node_mut() }.unwrap().remove(key)
+                let mut right = unsafe { self.right.tree_node_mut() }.unwrap();
+                if right.key == key {
+                    // FIXME: remove right
+                    return todo!();
+                }
+                right.remove(key)
             } else {
-                unsafe { self.left.tree_node_mut() }.unwrap().remove(key)
+                let left = unsafe { self.left.tree_node_mut() }.unwrap();
+                if left.key == key {
+                    // FIXME: remove left
+                    return todo!();
+                }
+                left.remove(key)
             }
+        }
+
+        fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
+            if self.key == approx_key {
+                return Some(ImplicitRbTreeNodeRef((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()));
+            }
+
+            todo!()
         }
 
     }
