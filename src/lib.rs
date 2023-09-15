@@ -2,6 +2,7 @@
 
 #![feature(core_intrinsics)]
 #![feature(strict_provenance)]
+#![feature(ptr_mask)]
 
 mod linux;
 mod util;

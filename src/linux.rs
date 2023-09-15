@@ -651,9 +651,9 @@ mod implicit_rb_tree {
         pub fn remove(&mut self, key: usize) -> Option<NonNull<()>> {
             let root = unsafe { self.root.as_mut().unwrap().tree_node_mut() };
             if !root.has_children() {
-                return unsafe { self.root.take() }; // FIXME: should we return the data ptr instead?
+                return unsafe { self.root.take().map(|node| node.0) }; // FIXME: should we return the data ptr instead?
             }
-            Some(root.remove(key))
+            Some(unsafe { root.remove(key) })
         }
 
         pub fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
@@ -665,7 +665,7 @@ mod implicit_rb_tree {
         
     }
 
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug, PartialEq)]
     pub struct ImplicitRbTreeNodeRef(NonNull<()>);
 
     impl ImplicitRbTreeNodeRef {
@@ -727,16 +727,20 @@ mod implicit_rb_tree {
         #[inline]
         unsafe fn new_black(parent: ImplicitRbTreeNodeRef, key: usize) -> Self {
             Self {
-                parent: parent.0.map_addr(|addr| addr | BLACK),
-                left: ImplicitRbTreeNodeRef(null_mut()),
-                right: ImplicitRbTreeNodeRef(null_mut()),
+                parent: parent.0.as_ptr().map_addr(|addr| addr | BLACK),
+                left: None,
+                right: None,
                 key,
             }
         }
 
         #[inline]
-        fn parent_ptr(&self) -> ImplicitRbTreeNodeRef {
-            ImplicitRbTreeNodeRef(self.parent.0.mask(PTR_MASK))
+        fn parent_ptr(&self) -> Option<ImplicitRbTreeNodeRef> {
+            let ptr = self.parent.mask(PTR_MASK);
+            if ptr.is_null() {
+                return None;
+            }
+            Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(ptr) }))
         }
 
         #[inline]
@@ -751,39 +755,43 @@ mod implicit_rb_tree {
 
         #[inline]
         fn sibling(&self) -> Option<ImplicitRbTreeNodeRef> {
-            if self.parent_ptr().is_null() {
-                return None;
+            match self.parent_ptr() {
+                None => None,
+                Some(parent_ptr) => {
+                    let right = unsafe { parent_ptr.tree_node().right };
+                    if right.map(|ptr| ptr.0.as_ptr()).unwrap_or(null_mut()).cast_const().cast::<ImplicitRbTreeNode>() == self as *const ImplicitRbTreeNode {
+                        let left = unsafe { parent_ptr.tree_node().left };
+                        return left;
+                    }
+                    debug_assert_eq!(unsafe { parent_ptr.tree_node().left }, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) })));
+                    right
+                }
             }
-            let right = unsafe { self.parent_ptr().tree_node().unwrap_unchecked().right };
-            if right.0.cast_const().cast::<ImplicitRbTreeNode>() == self as *const ImplicitRbTreeNode {
-                let left = unsafe { self.parent_ptr().tree_node().unwrap_unchecked().right };
-                return Some(left);
-            }
-            debug_assert_eq!(unsafe { self.parent_ptr().tree_node().unwrap_unchecked().left }, self as *const ImplicitRbTreeNode);
-            Some(right)
         }
 
         #[inline]
         fn has_children(&self) -> bool {
-            !(self.left.0.is_null() && self.right.0.is_null())
+            self.left.is_some() || self.right.is_some()
         }
 
         fn insert(&mut self, key: usize, addr: NonNull<()>) {
             if self.key < key {
-                if self.right.0.is_null() {
-                    self.right = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((&self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) }))) });
+                if let Some(right) = self.right {
+                    unsafe { right.tree_node_mut().insert(key, addr); }
                     // FIXME: fixup new node (recolor and rotate)
                     return;
                 }
-                unsafe { self.right.tree_node_mut().unwrap_unchecked().insert(key, addr); }
-                return;
-            }
-            if self.left.0.is_null() {
-                self.left = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((&self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) }))) });
+                self.right = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) });
                 // FIXME: fixup new node (recolor and rotate)
                 return;
             }
-            unsafe { self.left.tree_node_mut().unwrap_unchecked().insert(key, addr); }
+            if let Some(left) = self.left {
+                unsafe { left.tree_node_mut().insert(key, addr); }
+                // FIXME: fixup new node (recolor and rotate)
+                return;
+            }
+            self.left = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) });
+            // FIXME: fixup new node (recolor and rotate)
         }
 
         unsafe fn remove(&mut self, key: usize) -> NonNull<()> {
@@ -806,7 +814,7 @@ mod implicit_rb_tree {
 
         fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
             if self.key == approx_key {
-                return Some(ImplicitRbTreeNodeRef((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()));
+                return Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) }));
             }
 
             todo!()
