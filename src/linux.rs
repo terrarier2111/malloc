@@ -4,7 +4,7 @@ use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::mem::align_of;
-use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
+use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
 use crate::util::{align_unaligned_ptr_to, round_up_to};
@@ -190,11 +190,15 @@ fn map_memory(size: usize) -> *mut u8 {
 
 #[cfg(miri)]
 fn map_memory(size: usize) -> *mut u8 {
+    use libc::mmap;
+
     unsafe { libc::mmap(null_mut(), size as size_t, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1 as c_int, 0 as off64_t) }.cast::<u8>() // FIXME: can we handle return value?
 }
 
 #[cfg(miri)]
 fn unmap_memory(ptr: *mut u8, size: usize) {
+    use libc::munmap;
+
     let result = unsafe { munmap(ptr.cast::<c_void>(), size as size_t) };
     if result != 0 {
         // we can't handle this error properly, so just abort the process
@@ -227,6 +231,8 @@ fn unmap_memory(ptr: *mut u8, size: usize) {
 
 #[cfg(miri)]
 fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
+    use libc::mremap;
+
     unsafe { mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
 }
 
@@ -234,6 +240,8 @@ fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
 fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
     const MREMAP_SYSCALL_ID: usize = 25;
     let res_ptr;
+
+    // FIXME: set MAY_MOVE flag!
 
     unsafe {
         asm!(
@@ -645,7 +653,7 @@ mod implicit_rb_tree {
                 self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, None) });
                 return;
             }
-            unsafe { self.root.unwrap().tree_node().unwrap_unchecked() }.insert(key, addr);
+            unsafe { self.root.as_mut().unwrap_unchecked().tree_node_mut() }.insert(key, addr);
         }
 
         pub fn remove(&mut self, key: usize) -> Option<NonNull<()>> {
@@ -659,7 +667,7 @@ mod implicit_rb_tree {
         pub fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
             match &self.root {
                 None => None,
-                Some(node) => unsafe { node.tree_node() }.unwrap().find_approx_ge(approx_key),
+                Some(node) => unsafe { node.tree_node() }.find_approx_ge(approx_key),
             }
         }
         
@@ -694,8 +702,8 @@ mod implicit_rb_tree {
 
     #[inline]
     unsafe fn create_tree_node(key: usize, addr: NonNull<()>, color: Color, parent: Option<ImplicitRbTreeNodeRef>) -> ImplicitRbTreeNodeRef {
-        unsafe { addr.cast::<ImplicitRbTreeNode>().write(ImplicitRbTreeNode {
-            parent: parent.0.as_ptr().map_addr(|addr| addr | color as usize),
+        unsafe { addr.cast::<ImplicitRbTreeNode>().as_ptr().write(ImplicitRbTreeNode {
+            parent: parent.map_or(null_mut(), |node| node.0.as_ptr()).map_addr(|addr| addr | color as usize),
             left: None,
             right: None,
             key,
@@ -745,12 +753,12 @@ mod implicit_rb_tree {
 
         #[inline]
         pub(crate) fn is_red(&self) -> bool {
-            (self.parent.0 as usize) & COLOR_MASK == RED
+            (self.parent as usize) & COLOR_MASK == RED
         }
 
         #[inline]
         pub(crate) fn is_black(&self) -> bool {
-            (self.parent.0 as usize) & COLOR_MASK == BLACK
+            (self.parent as usize) & COLOR_MASK == BLACK
         }
 
         #[inline]
