@@ -615,6 +615,7 @@ mod chunk_ref {
 }
 
 mod implicit_rb_tree {
+    use std::cmp::Ordering;
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
 
@@ -937,11 +938,20 @@ mod implicit_rb_tree {
         }
 
         fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
-            if self.key == approx_key {
-                return Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) }));
+            match self.key.cmp(&approx_key) {
+                Ordering::Less => {
+                    if let Some(left) = self.left {
+                        let node = unsafe { left.tree_node() };
+                        if node.key >= approx_key {
+                            return node.find_approx_ge(approx_key);
+                        }
+                    }
+                    // just return this node as we are the smallest node that still satisfies the key's requirements
+                    Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) }))
+                }
+                Ordering::Equal => Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *const ImplicitRbTreeNode).cast_mut().cast::<()>()) })),
+                Ordering::Greater => None,
             }
-
-            todo!()
         }
 
     }
