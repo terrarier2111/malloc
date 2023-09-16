@@ -649,11 +649,14 @@ mod implicit_rb_tree {
         }
 
         pub fn insert(&mut self, key: usize, addr: NonNull<()>) {
-            if self.root.is_none() {
-                self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, None) });
-                return;
+            match self.root {
+                None => {
+                    self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, None) });
+                }
+                Some(root) => {
+                    unsafe { root.tree_node_mut() }.insert(key, addr);
+                }
             }
-            unsafe { self.root.as_mut().unwrap_unchecked().tree_node_mut() }.insert(key, addr);
         }
 
         pub fn remove(&mut self, key: usize) -> Option<NonNull<()>> {
@@ -665,7 +668,7 @@ mod implicit_rb_tree {
         }
 
         pub fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
-            match &self.root {
+            match self.root {
                 None => None,
                 Some(node) => unsafe { node.tree_node() }.find_approx_ge(approx_key),
             }
@@ -762,12 +765,17 @@ mod implicit_rb_tree {
         }
 
         #[inline]
+        pub(crate) fn set_color(&mut self, color: Color) {
+            self.parent = self.parent.map_addr(|raw| (raw & PTR_MASK) | color as usize);
+        }
+
+        #[inline]
         fn sibling(&self) -> Option<ImplicitRbTreeNodeRef> {
             match self.parent_ptr() {
                 None => None,
                 Some(parent_ptr) => {
                     let right = unsafe { parent_ptr.tree_node().right };
-                    if right.map(|ptr| ptr.0.as_ptr()).unwrap_or(null_mut()).cast_const().cast::<ImplicitRbTreeNode>() == self as *const ImplicitRbTreeNode {
+                    if right.map_or(null_mut(), |ptr| ptr.0.as_ptr()).cast_const().cast::<ImplicitRbTreeNode>() == self as *const ImplicitRbTreeNode {
                         let left = unsafe { parent_ptr.tree_node().left };
                         return left;
                     }
@@ -775,6 +783,17 @@ mod implicit_rb_tree {
                     right
                 }
             }
+        }
+
+        #[inline]
+        fn child_dir(&self, child: *mut ImplicitRbTreeNode) -> Direction {
+            if let Some(right) = self.right {
+                if right == ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(child.cast::<()>()) }) {
+                    return Direction::Right;
+                }
+            }
+            debug_assert_eq!(self.left, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(child.cast::<()>()) })));
+            Direction::Left
         }
 
         #[inline]
@@ -802,6 +821,103 @@ mod implicit_rb_tree {
             // FIXME: fixup new node (recolor and rotate)
         }
 
+        fn recolor_node(mut node: *mut ImplicitRbTreeNode) {
+            let mut curr_node = node;
+            while let Some(parent) = unsafe { curr_node.as_ref().unwrap_unchecked() }.parent_ptr() {
+                if unsafe { parent.tree_node() }.is_black() {
+                    // the parent is black so we have nothing to do here.
+                    break;
+                }
+                let uncle = unsafe { parent.tree_node() }.sibling();
+                let uncle_red = uncle.map_or(false, |uncle| unsafe { uncle.tree_node() }.is_red());
+                if uncle_red {
+                    unsafe { parent.tree_node_mut() }.set_color(Color::Black);
+                    unsafe { uncle.unwrap_unchecked().tree_node_mut() }.set_color(Color::Black);
+                    // update grand parent
+                    let grand_parent = unsafe { parent.tree_node().parent_ptr().unwrap_unchecked() };
+                    unsafe { grand_parent.tree_node_mut() }.set_color(Color::Red);
+                    curr_node = grand_parent.0.as_ptr().cast::<ImplicitRbTreeNode>();
+                    continue;
+                }
+
+            }
+        }
+
+        fn rotate_right(&mut self) {
+            let right = self.right;
+            self.right = if self.parent.is_null() {
+                None
+            } else {
+                Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(self.parent) }))
+            };
+            if let Some(mut right) = right {
+                unsafe { right.tree_node_mut() }.parent = self.parent;
+            }
+            if let Some(mut parent) = unsafe { self.parent.cast::<ImplicitRbTreeNode>().as_mut() } {
+                let this = self as *mut ImplicitRbTreeNode;
+                parent.left = right;
+                let new_parent = parent.parent;
+                parent.parent = this.cast::<()>();
+                self.parent = new_parent;
+                if let Some(mut new_parent) = unsafe { new_parent.cast::<ImplicitRbTreeNode>().as_mut() } {
+                    if new_parent.child_dir(parent) == Direction::Right {
+                        new_parent.right = Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(this.cast::<()>()) }));
+                    } else {
+                        new_parent.left = Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(this.cast::<()>()) }));
+                    }
+                }
+            } else {
+                self.parent = null_mut();
+            }
+        }
+
+        fn rotate_left(&mut self) {
+            let left = self.left;
+            self.left = if self.parent.is_null() {
+                None
+            } else {
+                Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(self.parent) }))
+            };
+            if let Some(mut left) = left {
+                let left = unsafe { left.tree_node_mut() };
+                left.parent = self.parent;
+                println!("rl 0");
+            }
+            if let Some(mut parent) = unsafe { self.parent.cast::<ImplicitRbTreeNode>().as_mut() } {
+                let this = self as *mut ImplicitRbTreeNode;
+                assert_eq!(parent.child_dir(this), Direction::Right);
+                parent.right = left;
+                let new_parent = parent.parent;
+                parent.parent = this.cast::<()>();
+                self.parent = new_parent;
+                if let Some(mut new_parent) = unsafe { new_parent.cast::<ImplicitRbTreeNode>().as_mut() } {
+                    if new_parent.child_dir(parent) == Direction::Left {
+                        new_parent.left = Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(this.cast::<()>()) }));
+                    } else {
+                        new_parent.right = Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked(this.cast::<()>()) }));
+                    }
+                }
+                println!("rl 1 {:?}", new_parent);
+            } else {
+                self.parent = null_mut();
+                assert!(left.is_none());
+                println!("rl 2");
+            }
+        }
+
+        #[inline]
+        fn map_rotations(parent: Direction, child: Direction) -> (Direction, Option<Direction>) {
+            // for cases like:
+            // \
+            //  P
+            //   \
+            //    C
+            if parent == child {
+                return (parent.rev(), None);
+            }
+            (child.rev(), Some(parent.rev()))
+        }
+
         unsafe fn remove(&mut self, key: usize) -> NonNull<()> {
             if self.key < key {// FIXME: check if key matches with right or left!
                 let mut right = unsafe { self.right.unwrap().tree_node_mut() };
@@ -826,6 +942,24 @@ mod implicit_rb_tree {
             }
 
             todo!()
+        }
+
+    }
+
+    #[derive(Copy, Clone, PartialEq, Debug)]
+    enum Direction {
+        Left,
+        Right,
+    }
+
+    impl Direction {
+
+        #[inline]
+        fn rev(self) -> Self {
+            match self {
+                Direction::Left => Direction::Right,
+                Direction::Right => Direction::Left,
+            }
         }
 
     }
