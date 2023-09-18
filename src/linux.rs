@@ -931,6 +931,22 @@ mod bit_tree_map {
     pub(crate) struct BitTreeMap<const ELEMENT_SIZE: usize> {
         root: BitTreeMapNode<ELEMENT_SIZE>,
     }
+    
+    impl<const ELEMENT_SIZE: usize> BitTreeMap<ELEMENT_SIZE> {
+        
+        pub fn new() -> Self {
+            Self {
+                root: BitTreeMapNode::new_leaf(),
+            }
+        }
+
+        pub fn insert_tip(&mut self) {
+            if self.root.is_leaf_node() {
+
+            }
+        }
+        
+    }
 
     const fn calc_sub_maps() -> usize {
         let mut sub_maps = 0;
@@ -988,6 +1004,21 @@ mod bit_tree_map {
         #[inline]
         pub(crate) fn is_leaf_node(&self) -> bool {
             self.parent as usize & LEAF_NODE_FLAG != 0
+        }
+
+        pub(crate) fn used_nodes(&self) -> usize {
+            // FIXME: this may need to fetch multiple cache lines if we have a cache line size larger than 64 bytes on 64 bit systems.
+            // FIXME: just place the whole bitmap next to each other to trade best case latency for predictability of the system's latency.
+            let mut used_nodes = 0;
+            for map_idx in 0..SUB_MAPS {
+                let map = unsafe { *(self as *const BitTreeMapNode<ELEMENT_SIZE> as *mut usize).sub(1 + map_idx * SUB_MAP_SLOTS / 8 + map_idx) };
+                used_nodes += map.count_ones();
+            }
+            used_nodes as usize
+        }
+
+        pub(crate) fn is_full(&self) -> bool {
+            self.used_nodes() != NODE_SLOTS
         }
 
     }
