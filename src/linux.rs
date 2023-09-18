@@ -4,6 +4,7 @@ use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::mem::align_of;
+use cache_padded::CachePadded;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
@@ -387,10 +388,12 @@ mod alloc_ref {
 mod chunk_ref {
     use crate::linux::CHUNK_METADATA_SIZE_ONE_SIDE;
 
-    // FIXME: assume that we have alignment >= 2
+    // FIXME: ensure that we have alignment >= 8
     const FIRST_CHUNK_FLAG: usize = 1 << 0;
     const LAST_CHUNK_FLAG: usize = 1 << 1;
     const FREE_CHUNK_FLAG: usize = 1 << 2;
+    const METADATA_MASK: usize = FIRST_CHUNK_FLAG | LAST_CHUNK_FLAG | FREE_CHUNK_FLAG;
+    const SIZE_MASK: usize = !METADATA_MASK;
 
     /// `START` indicates whether the stored reference is a reference to the chunk's start or end.
     #[derive(Copy, Clone)]
@@ -403,23 +406,22 @@ mod chunk_ref {
             self.0
         }
 
-    }
-
-    impl ChunkRef<true> {
-
         #[inline]
-        pub(crate) fn new_start(chunk_start: *mut u8) -> Self {
-            Self(chunk_start)
+        fn read_size_raw(&self) -> usize {
+            if START {
+                unsafe { *self.0.cast::<usize>() }
+            } else {
+                unsafe { *self.0.cast::<usize>().sub(1) }
+            }
         }
 
         #[inline]
-        pub(crate) fn setup(&mut self, size: usize, first_chunk: bool, last_chunk: bool) {
-            self.setup_own(size, first_chunk, last_chunk);
-            if self.into_end(size).0 as usize % 8 != 0 {
-                panic!("unaligned: {} size: {}", self.into_end(size).0 as usize % 8, size % 8);
+        fn write_size_raw(&mut self, size: usize) {
+            if START {
+                unsafe { *self.0.cast::<usize>() = size; }
+            } else {
+                unsafe { *self.0.cast::<usize>().sub(1) = size; }
             }
-            println!("checked alignment end {:?}", self.0);
-            self.into_end(size).setup_own(size, first_chunk, last_chunk);
         }
 
         #[inline]
@@ -439,24 +441,14 @@ mod chunk_ref {
 
         #[inline]
         pub(crate) fn read_size(&self) -> usize {
-            (self.read_size_raw() & !FIRST_CHUNK_FLAG)
-        }
-
-        #[inline]
-        fn read_size_raw(&self) -> usize {
-            unsafe { *self.0.cast::<usize>() }
+            (self.read_size_raw() & SIZE_MASK)
         }
 
         /// this doesn't modify the FIRST_CHUNK flag
         #[inline]
         pub(crate) fn update_size(&mut self, size: usize) {
-            let first_chunk_flag = self.read_size_raw() & FIRST_CHUNK_FLAG;
+            let first_chunk_flag = self.read_size_raw() & METADATA_MASK;
             self.write_size_raw(size | first_chunk_flag);
-        }
-
-        #[inline]
-        fn write_size_raw(&mut self, size: usize) {
-            unsafe { *self.0.cast::<usize>() = size; }
         }
 
         #[inline]
@@ -499,6 +491,25 @@ mod chunk_ref {
         #[inline]
         pub(crate) fn is_free(&self) -> bool {
             self.read_size_raw() & FREE_CHUNK_FLAG != 0
+        }
+
+    }
+
+    impl ChunkRef<true> {
+
+        #[inline]
+        pub(crate) fn new_start(chunk_start: *mut u8) -> Self {
+            Self(chunk_start)
+        }
+
+        #[inline]
+        pub(crate) fn setup(&mut self, size: usize, first_chunk: bool, last_chunk: bool) {
+            self.setup_own(size, first_chunk, last_chunk);
+            /*if self.into_end(size).0 as usize % 8 != 0 {
+                panic!("unaligned: {} size: {}", self.into_end(size).0 as usize % 8, size % 8);
+            }
+            println!("checked alignment end {:?}", self.0);*/
+            self.into_end(size).setup_own(size, first_chunk, last_chunk);
         }
 
         #[inline]
@@ -524,85 +535,6 @@ mod chunk_ref {
         pub(crate) fn setup(&mut self, size: usize, first_chunk: bool, last_chunk: bool) {
             self.setup_own(size, first_chunk, last_chunk);
             self.into_start(size).setup_own(size, first_chunk, last_chunk);
-        }
-
-        #[inline]
-        fn setup_own(&mut self, size: usize, first_chunk: bool, last_chunk: bool) {
-            let size = if first_chunk {
-                size | FIRST_CHUNK_FLAG
-            } else {
-                size
-            };
-            let size = if last_chunk {
-                size | LAST_CHUNK_FLAG
-            } else {
-                size
-            };
-            self.write_size_raw(size);
-        }
-
-        #[inline]
-        pub(crate) fn read_size(&self) -> usize {
-            (self.read_size_raw() & !FIRST_CHUNK_FLAG)
-        }
-
-        #[inline]
-        fn read_size_raw(&self) -> usize {
-            unsafe { *self.0.cast::<usize>().sub(1) }
-        }
-
-        /// this doesn't modify the FIRST_CHUNK flag
-        #[inline]
-        pub(crate) fn update_size(&mut self, size: usize) {
-            let first_chunk_flag = self.read_size_raw() & FIRST_CHUNK_FLAG;
-            self.write_size_raw(size | first_chunk_flag);
-        }
-
-        #[inline]
-        fn write_size_raw(&mut self, size: usize) {
-            unsafe { *self.0.cast::<usize>().sub(1) = size; }
-        }
-
-        #[inline]
-        pub(crate) fn set_first(&mut self, first: bool) {
-            if first {
-                self.write_size_raw(self.read_size_raw() | FIRST_CHUNK_FLAG);
-            } else {
-                self.write_size_raw(self.read_size_raw() & !FIRST_CHUNK_FLAG);
-            }
-        }
-
-        #[inline]
-        pub(crate) fn is_first(&self) -> bool {
-            self.read_size_raw() & FIRST_CHUNK_FLAG != 0
-        }
-
-        #[inline]
-        pub(crate) fn set_last(&mut self, last: bool) {
-            if last {
-                self.write_size_raw(self.read_size_raw() | LAST_CHUNK_FLAG);
-            } else {
-                self.write_size_raw(self.read_size_raw() & !LAST_CHUNK_FLAG);
-            }
-        }
-
-        #[inline]
-        pub(crate) fn is_last(&self) -> bool {
-            self.read_size_raw() & LAST_CHUNK_FLAG != 0
-        }
-
-        #[inline]
-        pub(crate) fn set_free(&mut self, free: bool) {
-            if free {
-                self.write_size_raw(self.read_size_raw() | FREE_CHUNK_FLAG);
-            } else {
-                self.write_size_raw(self.read_size_raw() & !FREE_CHUNK_FLAG);
-            }
-        }
-
-        #[inline]
-        pub(crate) fn is_free(&self) -> bool {
-            self.read_size_raw() & FREE_CHUNK_FLAG != 0
         }
 
         #[inline]
@@ -998,3 +930,5 @@ target_arch = "sparc64",
 target_arch = "riscv64"
 )))]
 pub(crate) const MIN_ALIGN: usize = 16;
+
+const CACHE_LINE_SIZE: usize = align_of::<CachePadded<()>>();
