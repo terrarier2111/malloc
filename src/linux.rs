@@ -948,8 +948,8 @@ mod bit_tree_map {
     const SUB_MAPS_SLOTS_COMBINED: usize = (NODE_SLOTS - SUB_MAPS) * 8;
     const SUB_MAP_SLOTS: usize = min(usize::BITS as usize, CACHE_LINE_SIZE);
 
-    const SUPER_MAP_FLAG: usize = 1 << 0;
-    const METADATA_MASK: usize = SUPER_MAP_FLAG;
+    const LEAF_NODE_FLAG: usize = 1 << 0;
+    const METADATA_MASK: usize = LEAF_NODE_FLAG;
     const PTR_MASK: usize = !METADATA_MASK;
 
     /// # Design
@@ -958,8 +958,8 @@ mod bit_tree_map {
     /// Every leaf node has up `entries = ((cache_line_size - size_of::<usize>()) * 8)` entries (leaf-tips).
     #[repr(C)]
     pub(crate) struct BitTreeMapNode<const ELEMENT_SIZE: usize> {
-        storage: CachePadded<[usize; NODE_SLOTS]>, // these are small bitmaps and ptrs to other bitmaps
-        parent: *mut BitTreeMapNode<ELEMENT_SIZE>, // the last bit of this ptr indicates whether we are a leaf node or not.
+        storage: CachePadded<[usize; NODE_SLOTS]>, // these are either simple bitmaps for normal nodes or small bitmaps and ptrs to other bitmaps for leaf nodes
+        parent: *mut BitTreeMapNode<ELEMENT_SIZE>, // the LSB of this ptr indicates whether we are a leaf node or not.
         _align: [u16; 0], // align this struct at least to 2 bytes.
     }
 
@@ -973,8 +973,21 @@ mod bit_tree_map {
             }
         }
 
+        pub(crate) fn new_leaf() -> Self {
+            Self {
+                storage: Default::default(),
+                parent: null_mut().map_addr(|addr| addr | LEAF_NODE_FLAG),
+                _align: [],
+            }
+        }
+
         pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
 
+        }
+
+        #[inline]
+        pub(crate) fn is_leaf_node(&self) -> bool {
+            self.parent as usize & LEAF_NODE_FLAG != 0
         }
 
     }
