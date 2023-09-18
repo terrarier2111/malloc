@@ -923,29 +923,30 @@ mod implicit_rb_tree {
 
 mod bit_tree_map {
     use std::mem::size_of;
+    use std::ptr::{NonNull, null_mut};
     use cache_padded::CachePadded;
     use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE};
     use crate::util::min;
 
-    pub(crate) struct BitTreeMap {
-        root: BitTreeMapNode,
+    pub(crate) struct BitTreeMap<const ELEMENT_SIZE: usize> {
+        root: BitTreeMapNode<ELEMENT_SIZE>,
     }
 
     const fn calc_sub_maps() -> usize {
         let mut sub_maps = 0;
         let mut bits = CACHE_LINE_SIZE * 8;
         while bits > 0 {
-            let sub_map_size = size_of::<usize>() * 8;
+            let sub_map_size = usize::BITS as usize;
             bits = bits.saturating_sub(SUB_MAP_SLOTS + sub_map_size);
             sub_maps += 1;
         }
         sub_maps
     }
 
-    const NODE_SLOTS: usize = CACHE_LINE_WORD_SIZE - 1; // the - 1 here comes from the fact that we have 1 flags word per node
+    const NODE_SLOTS: usize = CACHE_LINE_WORD_SIZE - 1; // the - 1 here comes from the fact that we have 1 parent word per node
     const SUB_MAPS: usize = calc_sub_maps();
-    const SUB_MAPS_SLOTS_COMBINED: usize = (CACHE_LINE_WORD_SIZE - SUB_MAPS) * 8;
-    const SUB_MAP_SLOTS: usize = min(size_of::<usize>() * 8, CACHE_LINE_SIZE);
+    const SUB_MAPS_SLOTS_COMBINED: usize = (NODE_SLOTS - SUB_MAPS) * 8;
+    const SUB_MAP_SLOTS: usize = min(usize::BITS as usize, CACHE_LINE_SIZE);
 
     const SUPER_MAP_FLAG: usize = 1 << 0;
     const METADATA_MASK: usize = SUPER_MAP_FLAG;
@@ -954,21 +955,63 @@ mod bit_tree_map {
     /// # Design
     /// Every non-leaf node has multiple children and may even have multiple sub-maps
     /// to manage said children, roughly speaking: `sub_map_cnt = (cache_line_size / (size_of::<usize>() * 8))`.
-    /// Every leaf node has up `entries = ((cache_line_size - size_of::<usize>()) * 8)` entries.
+    /// Every leaf node has up `entries = ((cache_line_size - size_of::<usize>()) * 8)` entries (leaf-tips).
     #[repr(C)]
-    pub(crate) struct BitTreeMapNode {
-        storage: CachePadded<[usize; CACHE_LINE_WORD_SIZE]>, // this can either be simple bits or small bitmaps and ptrs to other bitmaps
-                                                             // the last element can either be a list of flags or a map for a bunch of the contained submaps
+    pub(crate) struct BitTreeMapNode<const ELEMENT_SIZE: usize> {
+        storage: CachePadded<[usize; NODE_SLOTS]>, // these are small bitmaps and ptrs to other bitmaps
+        parent: *mut BitTreeMapNode<ELEMENT_SIZE>, // the last bit of this ptr indicates whether we are a leaf node or not.
         _align: [u16; 0], // align this struct at least to 2 bytes.
     }
 
-    impl BitTreeMapNode {
+    impl<const ELEMENT_SIZE: usize> BitTreeMapNode<ELEMENT_SIZE> {
 
         pub(crate) fn new() -> Self {
             Self {
                 storage: Default::default(),
+                parent: null_mut(),
                 _align: [],
             }
+        }
+
+        pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
+
+        }
+
+    }
+
+    pub(crate) struct BitMapEntry {
+        ptr: NonNull<()>,
+    }
+
+    pub(crate) struct BitTreeMapLeafTip<const ELEMENT_SIZE: usize> {
+        element_cnt: usize,
+        parent: *mut BitTreeMapNode<ELEMENT_SIZE>,
+    }
+
+    impl<const ELEMENT_SIZE: usize> BitTreeMapLeafTip<ELEMENT_SIZE> {
+
+        pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
+            // assume that we are inside the allocation page, such a page looks something like this:
+            // [entries, bitmaps, leaf tip, metadata]
+            let curr = self as *mut BitTreeMapLeafTip<ELEMENT_SIZE> as *mut ();
+            // FIXME: can we get rid of this div_ceil - we could by caching!
+            let bitmap_cnt = self.element_cnt.div_ceil(usize::BITS as usize);
+            // traverse the map backwards to allow for the possibility that we don't have to fetch
+            // another cache line if we are lucky
+            let end = unsafe { curr.cast::<usize>().sub(1) };
+            for i in 0..bitmap_cnt {
+                let map_ptr = unsafe { end.sub(i) };
+                let map = unsafe { *map_ptr };
+                let idx = map.trailing_zeros();
+                if idx != usize::BITS {
+                    Some(BitMapEntry {
+                        // FIXME: can we get rid of this get_page_size?
+                        // ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>() as usize / get_page_size() + (self.element_cnt - i * 8 - (usize::BITS - idx))) as *mut ()) },
+                        ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>().sub(i * size_of::<usize>() + idx)) as *mut ()) },
+                    })
+                }
+            }
+            None
         }
 
     }
