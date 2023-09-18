@@ -634,6 +634,11 @@ mod implicit_rb_tree {
             unsafe { NonNull::new_unchecked(self.0.cast::<u8>().as_ptr().add(size_of::<ImplicitRbTreeNode>())) }
         }
 
+        #[inline]
+        pub(crate) fn raw_ptr(self) -> *mut ImplicitRbTreeNode {
+            self.0.as_ptr().cast::<ImplicitRbTreeNode>()
+        }
+
     }
 
     #[inline]
@@ -738,20 +743,20 @@ mod implicit_rb_tree {
             if self.key < key {
                 if let Some(right) = self.right {
                     unsafe { right.tree_node_mut().insert(key, addr); }
-                    // FIXME: fixup new node (recolor and rotate)
                     return;
                 }
-                self.right = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) });
-                // FIXME: fixup new node (recolor and rotate)
+                let node = unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) };
+                self.right = Some(node);
+                Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>());
                 return;
             }
             if let Some(left) = self.left {
                 unsafe { left.tree_node_mut().insert(key, addr); }
-                // FIXME: fixup new node (recolor and rotate)
                 return;
             }
-            self.left = Some(unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) });
-            // FIXME: fixup new node (recolor and rotate)
+            let node = unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) };
+            self.left = Some(node);
+            Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>());
         }
 
         fn recolor_node(mut node: *mut ImplicitRbTreeNode) {
@@ -761,19 +766,27 @@ mod implicit_rb_tree {
                     // the parent is black so we have nothing to do here.
                     break;
                 }
-                let uncle = unsafe { parent.tree_node() }.sibling();
-                let uncle_red = uncle.map_or(false, |uncle| unsafe { uncle.tree_node() }.is_red());
-                if uncle_red {
-                    unsafe { parent.tree_node_mut() }.set_color(Color::Black);
-                    unsafe { uncle.unwrap_unchecked().tree_node_mut() }.set_color(Color::Black);
-                    // update grand parent
-                    let grand_parent = unsafe { parent.tree_node().parent_ptr().unwrap_unchecked() };
-                    unsafe { grand_parent.tree_node_mut() }.set_color(Color::Red);
-                    curr_node = grand_parent.0.as_ptr().cast::<ImplicitRbTreeNode>();
-                    continue;
+                if let Some(gp) = unsafe { parent.tree_node() }.parent_ptr() {
+                    let uncle = unsafe { parent.tree_node() }.sibling();
+                    let uncle_red = uncle.map_or(false, |uncle| unsafe { uncle.tree_node() }.is_red());
+                    if uncle_red {
+                        unsafe { parent.tree_node_mut() }.set_color(Color::Black);
+                        unsafe { uncle.unwrap_unchecked().tree_node_mut() }.set_color(Color::Black);
+                        // update grand parent
+                        let grand_parent = unsafe { parent.tree_node().parent_ptr().unwrap_unchecked() };
+                        unsafe { grand_parent.tree_node_mut() }.set_color(Color::Red);
+                        curr_node = grand_parent.0.as_ptr().cast::<ImplicitRbTreeNode>();
+                        continue;
+                    }
+                    let dir = unsafe { parent.tree_node() }.child_dir(curr_node);
+                    let parent_dir = unsafe { gp.tree_node() }.child_dir(parent.raw_ptr());
+                    let rotations = Self::map_rotations(parent_dir, dir);
+                    todo!()
+                } else {
+                    unreachable!();
                 }
-
             }
+            // TODO: recolor root node!
         }
 
         fn rotate_right(&mut self) {
