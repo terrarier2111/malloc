@@ -921,8 +921,64 @@ mod implicit_rb_tree {
 
 }
 
-// The minimum alignment guaranteed by the architecture. This value is used to
-// add fast paths for low alignment values.
+mod bit_tree_map {
+    use std::mem::size_of;
+    use cache_padded::CachePadded;
+    use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE};
+    use crate::util::min;
+
+    pub(crate) struct BitTreeMap {
+        root: BitTreeMapNode,
+    }
+
+    const fn calc_sub_maps() -> usize {
+        let mut sub_maps = 0;
+        let mut bits = CACHE_LINE_SIZE * 8;
+        while bits > 0 {
+            let sub_map_size = size_of::<usize>() * 8;
+            bits = bits.saturating_sub(SUB_MAP_SLOTS + sub_map_size);
+            sub_maps += 1;
+        }
+        sub_maps
+    }
+
+    const NODE_SLOTS: usize = CACHE_LINE_WORD_SIZE - 1; // the - 1 here comes from the fact that we have 1 flags word per node
+    const SUB_MAPS: usize = calc_sub_maps();
+    const SUB_MAPS_SLOTS_COMBINED: usize = (CACHE_LINE_WORD_SIZE - SUB_MAPS) * 8;
+    const SUB_MAP_SLOTS: usize = min(size_of::<usize>() * 8, CACHE_LINE_SIZE);
+
+    const SUPER_MAP_FLAG: usize = 1 << 0;
+    const METADATA_MASK: usize = SUPER_MAP_FLAG;
+    const PTR_MASK: usize = !METADATA_MASK;
+
+    /// # Design
+    /// Every non-leaf node has multiple children and may even have multiple sub-maps
+    /// to manage said children, roughly speaking: `sub_map_cnt = (cache_line_size / (size_of::<usize>() * 8))`.
+    /// Every leaf node has up `entries = ((cache_line_size - size_of::<usize>()) * 8)` entries.
+    #[repr(C)]
+    pub(crate) struct BitTreeMapNode {
+        storage: CachePadded<[usize; CACHE_LINE_WORD_SIZE]>, // this can either be simple bits or small bitmaps and ptrs to other bitmaps
+                                                             // the last element can either be a list of flags or a map for a bunch of the contained submaps
+        _align: [u16; 0], // align this struct at least to 2 bytes.
+    }
+
+    impl BitTreeMapNode {
+
+        pub(crate) fn new() -> Self {
+            Self {
+                storage: Default::default(),
+                _align: [],
+            }
+        }
+
+    }
+
+}
+
+const CACHE_LINE_SIZE: usize = align_of::<CachePadded<()>>();
+const CACHE_LINE_WORD_SIZE: usize = CACHE_LINE_SIZE / size_of::<usize>();
+
+// The minimum alignment guaranteed by the architecture.
 #[cfg(all(any(
 target_arch = "x86",
 target_arch = "arm",
@@ -943,5 +999,3 @@ target_arch = "sparc64",
 target_arch = "riscv64"
 )))]
 pub(crate) const MIN_ALIGN: usize = 16;
-
-const CACHE_LINE_SIZE: usize = align_of::<CachePadded<()>>();

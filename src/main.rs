@@ -1,6 +1,7 @@
 #![feature(core_intrinsics)]
 #![feature(ptr_mask)]
 #![feature(strict_provenance)]
+#![feature(int_roundings)]
 
 use allocator::{alloc, dealloc};
 

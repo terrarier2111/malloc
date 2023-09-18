@@ -11,3 +11,12 @@ pub(crate) fn round_up_to(val: usize, to: usize) -> usize {
     let diff = val % to;
     val + (to - diff)
 }
+
+#[inline]
+pub(crate) const fn min(left: usize, right: usize) -> usize {
+    if left > right {
+        right
+    } else {
+        left
+    }
+}
