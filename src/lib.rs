@@ -3,6 +3,7 @@
 #![feature(core_intrinsics)]
 #![feature(strict_provenance)]
 #![feature(ptr_mask)]
+#![feature(int_roundings)]
 
 mod linux;
 mod util;

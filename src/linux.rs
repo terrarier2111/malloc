@@ -1062,6 +1062,109 @@ mod bit_tree_map {
 
 }
 
+mod bit_map_list {
+    use std::mem::size_of;
+    use std::ptr::{NonNull, null_mut};
+    use cache_padded::CachePadded;
+    use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE, get_page_size};
+    use crate::util::min;
+
+    pub(crate) struct BitMapList<const ELEMENT_SIZE: usize> {
+        root: BitMapListNode<ELEMENT_SIZE>,
+    }
+
+    impl<const ELEMENT_SIZE: usize> BitMapList<ELEMENT_SIZE> {
+
+        pub fn new() -> Self {
+            Self {
+                root: BitMapListNode::create(),
+            }
+        }
+
+        pub fn insert_tip(&mut self) {
+            if self.root.is_leaf_node() {
+
+            }
+        }
+
+    }
+
+    const fn calc_sub_maps() -> usize {
+        let mut sub_maps = 0;
+        let mut bits = CACHE_LINE_SIZE * 8;
+        while bits > 0 {
+            let sub_map_size = usize::BITS as usize;
+            bits = bits.saturating_sub(SUB_MAP_SLOTS + sub_map_size);
+            sub_maps += 1;
+        }
+        sub_maps
+    }
+
+    const NODE_SLOTS: usize = CACHE_LINE_WORD_SIZE - 1; // the - 1 here comes from the fact that we have 1 parent word per node
+const SUB_MAPS: usize = calc_sub_maps();
+    const SUB_MAPS_SLOTS_COMBINED: usize = (NODE_SLOTS - SUB_MAPS) * 8;
+    const SUB_MAP_SLOTS: usize = min(usize::BITS as usize, CACHE_LINE_SIZE);
+
+    const LEAF_NODE_FLAG: usize = 1 << 0;
+    const METADATA_MASK: usize = LEAF_NODE_FLAG;
+    const PTR_MASK: usize = !METADATA_MASK;
+
+    pub(crate) struct BitMapEntry {
+        ptr: NonNull<()>,
+    }
+
+    pub(crate) struct BitMapListNode<const ELEMENT_SIZE: usize> {
+        element_cnt: usize,
+        next: *mut BitMapListNode<ELEMENT_SIZE>,
+        // FIXME: use one additional word as metadata (as we have to pad anyways)
+    }
+
+    impl<const ELEMENT_SIZE: usize> BitMapListNode<ELEMENT_SIZE> {
+
+        pub(crate) fn create(addr: *mut ()) {
+            let page_size = get_page_size();
+            let max_elem_cnt = page_size / ELEMENT_SIZE;
+            let sub_maps = max_elem_cnt.div_ceil(usize::BITS as usize);
+            let meta = size_of::<usize>() + size_of::<BitMapListNode<ELEMENT_SIZE>>() + sub_maps;
+            let elem_cnt = max_elem_cnt - meta.div_ceil(ELEMENT_SIZE);
+            unsafe { addr.cast::<usize>().write(ELEMENT_SIZE); }
+            unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode<ELEMENT_SIZE>>().write(BitMapListNode {
+                element_cnt: elem_cnt,
+                next: null_mut(),
+            }); }
+            for i in 0..sub_maps {
+                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode<ELEMENT_SIZE>>() + size_of::<usize>() * i).write(0); }
+            }
+        }
+
+        pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
+            // assume that we are inside the allocation page, such a page looks something like this:
+            // [entries, bitmaps, leaf tip, metadata]
+            let curr = self as *mut BitMapListNode<ELEMENT_SIZE> as *mut ();
+            // FIXME: can we get rid of this div_ceil - we could by caching!
+            let bitmap_cnt = self.element_cnt.div_ceil(usize::BITS as usize);
+            // traverse the map backwards to allow for the possibility that we don't have to fetch
+            // another cache line if we are lucky
+            let end = unsafe { curr.cast::<usize>().sub(1) };
+            for i in 0..bitmap_cnt {
+                let map_ptr = unsafe { end.sub(i) };
+                let map = unsafe { *map_ptr };
+                let idx = map.trailing_zeros();
+                if idx != usize::BITS {
+                    Some(BitMapEntry {
+                        // FIXME: can we get rid of this get_page_size?
+                        // ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>() as usize / get_page_size() + (self.element_cnt - i * 8 - (usize::BITS - idx))) as *mut ()) },
+                        ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>().sub(i * size_of::<usize>() + idx)) as *mut ()) },
+                    })
+                }
+            }
+            None
+        }
+
+    }
+
+}
+
 const CACHE_LINE_SIZE: usize = align_of::<CachePadded<()>>();
 const CACHE_LINE_WORD_SIZE: usize = CACHE_LINE_SIZE / size_of::<usize>();
 
