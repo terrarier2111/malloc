@@ -3,12 +3,14 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::mem::align_of;
+use std::mem::{align_of, MaybeUninit, transmute};
 use crossbeam_utils::CachePadded;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
 use crate::util::{align_unaligned_ptr_to, round_up_to};
+
+use self::bit_map_list::BitMapList;
 
 // FIXME: reuse allocations and maybe use sbrk
 
@@ -16,7 +18,7 @@ const NOT_PRESENT: usize = 0;
 
 static PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
 
-static FREE_CHUNK_ROOT: AtomicPtr<()> = AtomicPtr::new(null_mut()); // this is the root for the implicit RB-tree
+static FREE_CHUNK_ROOT: AtomicPtr<()> = AtomicPtr::new(null_mut()); // this is the root for the implicit global RB-tree
 
 /// `chunk_start` indicates the start of the chunk (including metadata)
 /// `size` indicates the chunk size in bytes
@@ -28,6 +30,35 @@ fn push_free_chunk(chunk_start: *mut u8, size: usize) {
     }
 
 }
+
+const fn construct_buckets() -> [BitMapList; BUCKETS] {
+    // we have to use several nasty workarounds here as many const things are not stable yet.
+    let mut buckets = unsafe { MaybeUninit::<[MaybeUninit<BitMapList>; BUCKETS]>::uninit().assume_init() };
+    let mut i = 0;
+    let base = BitMapList::new_empty();
+    while i < BUCKETS {
+        unsafe { core::ptr::copy(&base as *const BitMapList, buckets[i].as_ptr().cast_mut(), 1); }
+        i += 1;
+    }
+    unsafe { transmute(buckets) }
+}
+
+#[thread_local]
+static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache {
+    buckets: construct_buckets(),
+    free_chunk_root: null_mut(),
+};
+
+const BUCKETS: usize = 10;
+const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+struct ThreadLocalCache {
+    buckets: [BitMapList; BUCKETS],
+    free_chunk_root: *mut (), // this acts as a local cache for free chunks
+}
+
+unsafe impl Send for ThreadLocalCache {}
+unsafe impl Sync for ThreadLocalCache {}
 
 #[inline]
 fn get_page_size() -> usize {
@@ -1073,15 +1104,16 @@ mod bit_map_list {
     /// This is basically just a linked list of bitmaps that has links to the first and last node.
     /// New nodes will be appended to the end in order to allow the root node to be emptied of entries and as such
     /// reduce fragmentation of the system and allow for more frequent deallocation of nodes at the tail (if the are empty).
-    pub(crate) struct BitMapList<const ELEMENT_SIZE: usize> {
-        head: Option<NonNull<BitMapListNode<ELEMENT_SIZE>>>,
-        tail: Option<NonNull<BitMapListNode<ELEMENT_SIZE>>>,
+    #[derive(Default)]
+    pub(crate) struct BitMapList {
+        head: Option<NonNull<BitMapListNode>>,
+        tail: Option<NonNull<BitMapListNode>>,
         entries: usize,
     }
 
-    impl<const ELEMENT_SIZE: usize> BitMapList<ELEMENT_SIZE> {
+    impl BitMapList {
 
-        pub fn new(first_node: NonNull<BitMapListNode<ELEMENT_SIZE>>) -> Self {
+        pub fn new(first_node: NonNull<BitMapListNode>) -> Self {
             Self {
                 head: Some(first_node),
                 tail: Some(first_node),
@@ -1089,7 +1121,16 @@ mod bit_map_list {
             }
         }
 
-        pub fn insert_node(&mut self, mut node: NonNull<BitMapListNode<ELEMENT_SIZE>>) {
+        #[inline]
+        pub const fn new_empty() -> Self {
+            Self {
+                head: None,
+                tail: None,
+                entries: 0,
+            }
+        }
+
+        pub fn insert_node(&mut self, mut node: NonNull<BitMapListNode>) {
             self.entries += 1;
             if self.head.is_none() {
                 self.head = Some(node);
@@ -1136,35 +1177,36 @@ mod bit_map_list {
         ptr: NonNull<()>,
     }
 
-    pub(crate) struct BitMapListNode<const ELEMENT_SIZE: usize> {
+    pub(crate) struct BitMapListNode {
         element_cnt: usize,
-        next: *mut BitMapListNode<ELEMENT_SIZE>,
+        next: *mut BitMapListNode,
         // FIXME: use one additional word as metadata (as we have to pad anyways)
     }
 
-    impl<const ELEMENT_SIZE: usize> BitMapListNode<ELEMENT_SIZE> {
+    impl BitMapListNode {
 
-        pub(crate) fn create(addr: *mut ()) -> NonNull<Self> {
+        pub(crate) fn create(addr: *mut (), element_size: usize) -> NonNull<Self> {
             let page_size = get_page_size();
-            let max_elem_cnt = page_size / ELEMENT_SIZE;
+            // FIXME: cache all these values for all used bucket sizes on startup
+            let max_elem_cnt = page_size / element_size;
             let sub_maps = max_elem_cnt.div_ceil(usize::BITS as usize);
-            let meta = size_of::<usize>() + size_of::<BitMapListNode<ELEMENT_SIZE>>() + sub_maps;
-            let elem_cnt = max_elem_cnt - meta.div_ceil(ELEMENT_SIZE);
-            unsafe { addr.cast::<usize>().write(ELEMENT_SIZE); }
-            unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode<ELEMENT_SIZE>>().write(BitMapListNode {
+            let meta = size_of::<usize>() + size_of::<BitMapListNode>() + sub_maps;
+            let elem_cnt = max_elem_cnt - meta.div_ceil(element_size);
+            unsafe { addr.cast::<usize>().write(element_size); }
+            unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode>().write(BitMapListNode {
                 element_cnt: elem_cnt,
                 next: null_mut(),
             }); }
             for i in 0..sub_maps {
-                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode<ELEMENT_SIZE>>() + size_of::<usize>() * i).write(0); }
+                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + size_of::<usize>() * i).write(0); }
             }
-            unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode<ELEMENT_SIZE>>()) }
+            unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode>()) }
         }
 
         pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
             // assume that we are inside the allocation page, such a page looks something like this:
             // [entries, bitmaps, leaf tip, metadata]
-            let curr = self as *mut BitMapListNode<ELEMENT_SIZE> as *mut ();
+            let curr = self as *mut BitMapListNode as *mut ();
             // FIXME: can we get rid of this div_ceil - we could by caching!
             let bitmap_cnt = self.element_cnt.div_ceil(usize::BITS as usize);
             // traverse the map backwards to allow for the possibility that we don't have to fetch

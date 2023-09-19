@@ -1,5 +1,6 @@
 // #![no_std]
 
+#![feature(thread_local)]
 #![feature(core_intrinsics)]
 #![feature(strict_provenance)]
 #![feature(ptr_mask)]

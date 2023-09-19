@@ -2,6 +2,7 @@
 #![feature(ptr_mask)]
 #![feature(strict_provenance)]
 #![feature(int_roundings)]
+#![feature(thread_local)]
 
 use allocator::{alloc, dealloc};
 
