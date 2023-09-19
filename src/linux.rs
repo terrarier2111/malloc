@@ -4,7 +4,7 @@ use core::mem::size_of;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::mem::align_of;
-use cache_padded::CachePadded;
+use crossbeam_utils::CachePadded;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
@@ -921,10 +921,11 @@ mod implicit_rb_tree {
 
 }
 
-mod bit_tree_map {
+/*mod bit_tree_map {
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
-    use cache_padded::CachePadded;
+    use crossbeam_utils::CachePadded;
+
     use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE};
     use crate::util::min;
 
@@ -992,7 +993,7 @@ mod bit_tree_map {
         pub(crate) fn new_leaf() -> Self {
             Self {
                 storage: Default::default(),
-                parent: null_mut().map_addr(|addr| addr | LEAF_NODE_FLAG),
+                parent: null_mut::<BitTreeMapNode<ELEMENT_SIZE>>().map_addr(|addr| addr | LEAF_NODE_FLAG),
                 _align: [],
             }
         }
@@ -1060,31 +1061,57 @@ mod bit_tree_map {
 
     }
 
-}
+}*/
 
 mod bit_map_list {
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
-    use cache_padded::CachePadded;
     use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE, get_page_size};
     use crate::util::min;
 
+    /// # Design
+    /// This is basically just a linked list of bitmaps that has links to the first and last node.
+    /// New nodes will be appended to the end in order to allow the root node to be emptied of entries and as such
+    /// reduce fragmentation of the system and allow for more frequent deallocation of nodes at the tail (if the are empty).
     pub(crate) struct BitMapList<const ELEMENT_SIZE: usize> {
-        root: BitMapListNode<ELEMENT_SIZE>,
+        head: Option<NonNull<BitMapListNode<ELEMENT_SIZE>>>,
+        tail: Option<NonNull<BitMapListNode<ELEMENT_SIZE>>>,
+        entries: usize,
     }
 
     impl<const ELEMENT_SIZE: usize> BitMapList<ELEMENT_SIZE> {
 
-        pub fn new() -> Self {
+        pub fn new(first_node: NonNull<BitMapListNode<ELEMENT_SIZE>>) -> Self {
             Self {
-                root: BitMapListNode::create(),
+                head: Some(first_node),
+                tail: Some(first_node),
+                entries: 1,
             }
         }
 
-        pub fn insert_tip(&mut self) {
-            if self.root.is_leaf_node() {
-
+        pub fn insert_node(&mut self, mut node: NonNull<BitMapListNode<ELEMENT_SIZE>>) {
+            self.entries += 1;
+            if self.head.is_none() {
+                self.head = Some(node);
+                self.tail = Some(node);
+                return;
             }
+            let mut old_tail = unsafe { self.tail.unwrap_unchecked() };
+            self.tail = Some(node);
+            unsafe { old_tail.as_mut() }.next = node.as_ptr();
+        }
+
+        pub fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
+            if self.head.is_none() {
+                return None;
+            }
+            let ret = unsafe { self.head.unwrap_unchecked().as_mut() }.alloc_free_entry();
+            if ret.is_none() {
+                // get rid of old entry
+                self.entries -= 1;
+                self.head = NonNull::new(unsafe { self.head.unwrap_unchecked().as_ref().next });
+            }
+            ret
         }
 
     }
@@ -1101,13 +1128,9 @@ mod bit_map_list {
     }
 
     const NODE_SLOTS: usize = CACHE_LINE_WORD_SIZE - 1; // the - 1 here comes from the fact that we have 1 parent word per node
-const SUB_MAPS: usize = calc_sub_maps();
+    const SUB_MAPS: usize = calc_sub_maps();
     const SUB_MAPS_SLOTS_COMBINED: usize = (NODE_SLOTS - SUB_MAPS) * 8;
     const SUB_MAP_SLOTS: usize = min(usize::BITS as usize, CACHE_LINE_SIZE);
-
-    const LEAF_NODE_FLAG: usize = 1 << 0;
-    const METADATA_MASK: usize = LEAF_NODE_FLAG;
-    const PTR_MASK: usize = !METADATA_MASK;
 
     pub(crate) struct BitMapEntry {
         ptr: NonNull<()>,
@@ -1121,7 +1144,7 @@ const SUB_MAPS: usize = calc_sub_maps();
 
     impl<const ELEMENT_SIZE: usize> BitMapListNode<ELEMENT_SIZE> {
 
-        pub(crate) fn create(addr: *mut ()) {
+        pub(crate) fn create(addr: *mut ()) -> NonNull<Self> {
             let page_size = get_page_size();
             let max_elem_cnt = page_size / ELEMENT_SIZE;
             let sub_maps = max_elem_cnt.div_ceil(usize::BITS as usize);
@@ -1135,6 +1158,7 @@ const SUB_MAPS: usize = calc_sub_maps();
             for i in 0..sub_maps {
                 unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode<ELEMENT_SIZE>>() + size_of::<usize>() * i).write(0); }
             }
+            unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode<ELEMENT_SIZE>>()) }
         }
 
         pub(crate) fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
@@ -1149,13 +1173,13 @@ const SUB_MAPS: usize = calc_sub_maps();
             for i in 0..bitmap_cnt {
                 let map_ptr = unsafe { end.sub(i) };
                 let map = unsafe { *map_ptr };
-                let idx = map.trailing_zeros();
-                if idx != usize::BITS {
-                    Some(BitMapEntry {
+                let idx = map.trailing_zeros() as usize;
+                if idx != usize::BITS as usize {
+                    return Some(BitMapEntry {
                         // FIXME: can we get rid of this get_page_size?
                         // ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>() as usize / get_page_size() + (self.element_cnt - i * 8 - (usize::BITS - idx))) as *mut ()) },
                         ptr: unsafe { NonNull::new_unchecked((curr.cast::<usize>().sub(i * size_of::<usize>() + idx)) as *mut ()) },
-                    })
+                    });
                 }
             }
             None
