@@ -5,6 +5,7 @@
 #![feature(strict_provenance)]
 #![feature(ptr_mask)]
 #![feature(int_roundings)]
+#![feature(linkage)]
 
 mod linux;
 mod util;

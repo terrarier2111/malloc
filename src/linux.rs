@@ -5,7 +5,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::mem::{align_of, MaybeUninit, transmute};
 use crossbeam_utils::CachePadded;
-use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
+use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf, pthread_setspecific};
 use crate::linux::alloc_ref::AllocRef;
 use crate::linux::chunk_ref::ChunkRef;
 use crate::util::{align_unaligned_ptr_to, round_up_to};
@@ -43,6 +43,43 @@ const fn construct_buckets() -> [BitMapList; BUCKETS] {
     unsafe { transmute(buckets) }
 }
 
+
+// Provides thread-local destructors without an associated "key", which
+// can be more efficient.
+
+// Since what appears to be glibc 2.18 this symbol has been shipped which
+// GCC and clang both use to invoke destructors in thread_local globals, so
+// let's do the same!
+//
+// Note, however, that we run on lots older linuxes, as well as cross
+// compiling from a newer linux to an older linux, so we also have a
+// fallback implementation to use as well.
+pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u8)) {
+    use core::mem;
+
+    extern "C" {
+        #[linkage = "extern_weak"]
+        static __dso_handle: *mut u8;
+        #[linkage = "extern_weak"]
+        static __cxa_thread_atexit_impl: *const libc::c_void;
+    }
+    if !__cxa_thread_atexit_impl.is_null() {
+        type F = unsafe extern "C" fn(
+            dtor: unsafe extern "C" fn(*mut u8),
+            arg: *mut u8,
+            dso_handle: *mut u8,
+        ) -> libc::c_int;
+        mem::transmute::<*const libc::c_void, F>(__cxa_thread_atexit_impl)(
+            dtor,
+            t,
+            &__dso_handle as *const _ as *mut _,
+        );
+        return;
+    }
+    // we can't actually register a handler and we don't have a fallback impl just yet, so simply fail for now.
+    core::intrinsics::abort();
+}
+
 #[thread_local]
 static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache {
     buckets: construct_buckets(),
@@ -68,7 +105,7 @@ fn get_page_size() -> usize {
     }
     setup_page_size()
 }
-
+// 
 #[cold]
 #[inline(never)]
 fn setup_page_size() -> usize {
@@ -1097,8 +1134,14 @@ mod implicit_rb_tree {
 mod bit_map_list {
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
+    use libc::pthread_setspecific;
+
     use crate::linux::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE, get_page_size};
     use crate::util::min;
+
+    use super::register_dtor;
+
+    const REGISTERED_FLAG: usize = 1 << (usize::BITS - 1);
 
     /// # Design
     /// This is basically just a linked list of bitmaps that has links to the first and last node.
@@ -1113,14 +1156,6 @@ mod bit_map_list {
 
     impl BitMapList {
 
-        pub fn new(first_node: NonNull<BitMapListNode>) -> Self {
-            Self {
-                head: Some(first_node),
-                tail: Some(first_node),
-                entries: 1,
-            }
-        }
-
         #[inline]
         pub const fn new_empty() -> Self {
             Self {
@@ -1133,6 +1168,9 @@ mod bit_map_list {
         pub fn insert_node(&mut self, mut node: NonNull<BitMapListNode>) {
             self.entries += 1;
             if self.head.is_none() {
+                if self.entries & REGISTERED_FLAG == 0 {
+                    unsafe { register_dtor(t, dtor); }
+                }
                 self.head = Some(node);
                 self.tail = Some(node);
                 return;
@@ -1153,6 +1191,11 @@ mod bit_map_list {
                 self.head = NonNull::new(unsafe { self.head.unwrap_unchecked().as_ref().next });
             }
             ret
+        }
+
+        #[inline]
+        pub fn entries(&self) -> usize {
+            self.entries & !REGISTERED_FLAG
         }
 
     }
