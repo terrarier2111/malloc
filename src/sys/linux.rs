@@ -121,6 +121,14 @@ fn setup_page_size() -> usize {
 /// returns memory aligned to ptr size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
+    let page_size = get_page_size();
+    if size > page_size {
+        return alloc_chunked(size);
+    }
+    
+}
+
+fn alloc_chunked(size: usize) -> *mut u8 {
     let size = round_up_to(size, align_of::<usize>());
     let page_size = get_page_size();
 
