@@ -6,7 +6,7 @@ use std::ptr::null_mut;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf, pthread_setspecific};
 use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_PADDING, ALLOC_FULL_INITIAL_METADATA_SIZE, alloc_chunk_start, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
-use crate::util::{align_unaligned_ptr_to, round_up_to};
+use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of};
 
 use self::bit_map_list::BitMapList;
 
@@ -129,10 +129,10 @@ pub fn alloc(size: usize) -> *mut u8 {
 }
 
 fn alloc_chunked(size: usize) -> *mut u8 {
-    let size = round_up_to(size, align_of::<usize>());
+    let size = round_up_to_multiple_of(size, align_of::<usize>());
     let page_size = get_page_size();
 
-    let full_size = round_up_to(size + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
+    let full_size = round_up_to_multiple_of(size + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
 
     println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
@@ -157,16 +157,16 @@ fn alloc_chunked(size: usize) -> *mut u8 {
 
 #[inline]
 pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
-    let size = round_up_to(size, align_of::<usize>());
+    let size = round_up_to_multiple_of(size, align_of::<usize>());
     let page_size = get_page_size();
-    let full_size = round_up_to(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
+    let full_size = round_up_to_multiple_of(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
     let alloc_ptr = map_memory(full_size);
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size);
-    let mut desired_chunk_start = unsafe { align_unaligned_ptr_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
+    let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
     if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
         desired_chunk_start = unsafe { desired_chunk_start.add(size) };
     }
@@ -481,3 +481,32 @@ mod bit_map_list {
     }
 
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn thread_identifier() -> usize {
+    let res;
+    unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, readonly, preserve_flags)); }
+    res
+}
+
+#[cfg(all(target_arch = "x86", target_os = "linux"))]
+fn thread_identifier() -> usize {
+    let res;
+    unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, readonly, preserve_flags)); }
+    res
+}
+
+#[cfg(all(target_arch = "aarch64"))] // FIXME: does this actually work on linux and is it specific to linux?
+fn thread_identifier() -> usize {
+    let res;
+    unsafe { asm!("mrs {}, TPIDR_EL0", out(reg) res); }
+    res
+}
+
+/* // FIXME: try using a compatible way to accessing this
+#[cfg(all(target_arch = "arm"))] // FIXME: does this actually work on linux and is it specific to linux?
+fn thread_identifier() -> usize {
+    let res;
+    unsafe { asm!("mrc p15, 0, {}, c13, c0, 2", out(reg) res); }
+    res
+}*/
