@@ -2,6 +2,8 @@ use std::cmp::Ordering;
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
 
+    use crate::util::abort;
+
     const RED: usize = 0 << 0;
     const BLACK: usize = 1 << 0;
 
@@ -56,6 +58,11 @@ use std::cmp::Ordering;
                 None => None,
                 Some(node) => unsafe { node.tree_node() }.find_approx_ge(approx_key),
             }
+        }
+
+        #[inline]
+        pub const fn root_ref(&self) -> Option<ImplicitRbTreeNodeRef> {
+            self.root
         }
         
     }
@@ -234,9 +241,27 @@ use std::cmp::Ordering;
                     let dir = unsafe { parent.tree_node() }.child_dir(curr_node);
                     let parent_dir = unsafe { gp.tree_node() }.child_dir(parent.raw_ptr());
                     let rotations = Self::map_rotations(parent_dir, dir);
-                    todo!()
+                    match rotations.1 {
+                        Some(first_rotation) => {
+                            unsafe { &mut *curr_node }.rotate(first_rotation);
+                            unsafe { &mut *parent.tree_node_mut() }.rotate(rotations.0);
+                            unsafe { &mut *curr_node }.set_color(Color::Black);
+                        },
+                        None => {
+                            unsafe { &mut *parent.tree_node_mut() }.rotate(rotations.0);
+                            unsafe { &mut *parent.tree_node_mut() }.set_color(Color::Black);
+                        },
+                    }
+                    unsafe { &mut *gp.tree_node() }.set_color(Color::Red);
+                    // try checking the next node
+                    if let Some(next_check) = unsafe { curr_node.as_ref().unwrap_unchecked() }.parent_ptr() {
+                        curr_node = next_check.raw_ptr();
+                    } else {
+                        // we went through all things, so we should be fine now
+                        break;
+                    }
                 } else {
-                    unreachable!();
+                    abort();
                 }
             }
             unsafe { &mut *root }.set_color(Color::Black);
@@ -301,6 +326,13 @@ use std::cmp::Ordering;
                 self.parent = null_mut();
                 assert!(left.is_none());
                 println!("rl 2");
+            }
+        }
+
+        fn rotate(&mut self, dir: Direction) {
+            match dir {
+                Direction::Left => self.rotate_left(),
+                Direction::Right => self.rotate_right(),
             }
         }
 

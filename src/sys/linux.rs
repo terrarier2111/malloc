@@ -1,16 +1,16 @@
 use core::arch::asm;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::mem::{align_of, MaybeUninit, transmute, size_of};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::mem::{align_of, size_of};
 use std::ptr::null_mut;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_PADDING, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::page_ref::PageRef;
-use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of};
+use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
 
-use self::bit_map_list::BitMapList;
 use self::global_free_list::GlobalFreeList;
+use self::local_cache::ThreadLocalCache;
 
 // FIXME: reuse allocations and maybe use sbrk
 
@@ -58,19 +58,6 @@ mod global_free_list {
 
 }
 
-const fn construct_buckets() -> [BitMapList; BUCKETS] {
-    // we have to use several nasty workarounds here as many const things are not stable yet.
-    let mut buckets = unsafe { MaybeUninit::<[MaybeUninit<BitMapList>; BUCKETS]>::uninit().assume_init() };
-    let mut i = 0;
-    let base = BitMapList::new_empty();
-    while i < BUCKETS {
-        unsafe { core::ptr::copy(&base as *const BitMapList, buckets[i].as_ptr().cast_mut(), 1); }
-        i += 1;
-    }
-    unsafe { transmute(buckets) }
-}
-
-
 // Provides thread-local destructors without an associated "key", which
 // can be more efficient.
 
@@ -104,7 +91,7 @@ pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u8)) {
         return;
     }
     // we can't actually register a handler and we don't have a fallback impl just yet, so simply fail for now.
-    core::intrinsics::abort();
+    abort();
 }
 
 #[thread_local]
@@ -113,42 +100,65 @@ static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
 fn cleanup_tls() {
     // we store the metadata about the size and next ptr in the allocations themselves
     // this means that we will trash the cache more and we have to fetch more things into
-    // it but we don't have to use as much memory. // FIXME: is this tradeoff worth it?
-    let mut chunk = LOCAL_CACHE.free_chunk_root;
-    while !chunk.is_null() {
-        let page = unsafe { PageRef::from_page_ptr(chunk) };
+    // it but we don't have to use as much memory. We have to load 24 bytes (on 64 bit systems)
+    // anyways as we have 2 ptrs to children and one key for traversal.
+    // FIXME: is this tradeoff worth it?
+    let mut chunk_ref = LOCAL_CACHE.free_chunk_root.root_ref();
+    while let Some(chunk) = chunk_ref {
+        let page = unsafe { PageRef::from_page_ptr(chunk.raw_ptr().cast::<()>()) };
         let alloc = AllocRef::new_start(page.into_content_start().cast::<u8>());
         let size = alloc.read_size() / get_page_size(); // FIXME: should the size value already be stored in multiples of page size inside the alloc?
 
     }
 }
 
-// static NOT_SETUP_SENTINEL: u8 = 0;
+mod local_cache {
 
-const BUCKETS: usize = 10;
-const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+    // static NOT_SETUP_SENTINEL: u8 = 0;
 
-struct ThreadLocalCache {
-    buckets: [BitMapList; BUCKETS],
-    free_chunk_root: *mut (), // this acts as a local cache for free chunks
-}
+    use std::mem::{MaybeUninit, transmute};
 
-unsafe impl Send for ThreadLocalCache {}
-unsafe impl Sync for ThreadLocalCache {}
+    use crate::implicit_rb_tree::ImplicitRbTree;
 
-impl ThreadLocalCache {
+    use super::bit_map_list::BitMapList;
 
-    pub const fn new() -> Self {
-        Self {
-            buckets: construct_buckets(),
-            free_chunk_root: null_mut(),
+    const BUCKETS: usize = 10;
+    const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    const fn construct_buckets() -> [BitMapList; BUCKETS] {
+        // we have to use several nasty workarounds here as many const things are not stable yet.
+        let mut buckets = unsafe { MaybeUninit::<[MaybeUninit<BitMapList>; BUCKETS]>::uninit().assume_init() };
+        let mut i = 0;
+        let base = BitMapList::new_empty();
+        while i < BUCKETS {
+            unsafe { core::ptr::copy(&base as *const BitMapList, buckets[i].as_ptr().cast_mut(), 1); }
+            i += 1;
         }
+        unsafe { transmute(buckets) }
     }
 
-    pub fn push_free_chunk(&mut self, chunk: *mut ()) {
-        
+    pub(crate) struct ThreadLocalCache {
+        pub(crate) buckets: [BitMapList; BUCKETS],
+        pub(crate) free_chunk_root: ImplicitRbTree, // this acts as a local cache for free chunks
     }
 
+    unsafe impl Send for ThreadLocalCache {}
+    unsafe impl Sync for ThreadLocalCache {}
+
+    impl ThreadLocalCache {
+
+        pub const fn new() -> Self {
+            Self {
+                buckets: construct_buckets(),
+                free_chunk_root: ImplicitRbTree::new(),
+            }
+        }
+
+        pub fn push_free_chunk(&mut self, chunk: *mut ()) {
+            
+        }
+
+    }
 }
 
 #[inline]
@@ -339,10 +349,12 @@ fn map_memory(size: usize) -> *mut u8 {
 fn unmap_memory(ptr: *mut u8, size: usize) {
     use libc::munmap;
 
+    use crate::util::abort;
+
     let result = unsafe { munmap(ptr.cast::<c_void>(), size as size_t) };
     if result != 0 {
         // we can't handle this error properly, so just abort the process
-        core::intrinsics::abort();
+        abort();
     }
 }
 
@@ -365,7 +377,7 @@ fn unmap_memory(ptr: *mut u8, size: usize) {
 
     if result != 0 {
         // we can't handle this error properly, so just abort the process
-        core::intrinsics::abort();
+        abort();
     }
 }
 

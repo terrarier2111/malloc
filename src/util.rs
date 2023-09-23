@@ -26,3 +26,10 @@ pub(crate) const fn min(left: usize, right: usize) -> usize {
         left
     }
 }
+
+/// This function should be used instead of any specific
+/// instrinsic or library function as there doesn't seem to
+/// be a stable, fast way to abort in no_std contexts.
+pub(crate) fn abort() -> ! {
+    core::intrinsics::abort()
+}

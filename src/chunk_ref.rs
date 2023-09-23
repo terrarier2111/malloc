@@ -57,7 +57,7 @@ impl<const START: bool> ChunkRef<START> {
 
     #[inline]
     pub(crate) fn read_size(&self) -> usize {
-        (self.read_size_raw() & SIZE_MASK)
+        self.read_size_raw() & SIZE_MASK
     }
 
     /// this doesn't modify the FIRST_CHUNK flag
