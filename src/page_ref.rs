@@ -1,5 +1,7 @@
 use crate::util::round_down_to_multiple_of;
 
+// FIXME: merge this with alloc_ref
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PageRef(*mut ());
 
@@ -18,7 +20,7 @@ impl PageRef {
     #[inline]
     pub unsafe fn setup(&mut self, kind: PageKind) {
         let raw = match kind {
-            PageKind::ChunkPage { alloc_page_offset } => alloc_page_offset | CHUNK_ALLOC_FLAG,
+            PageKind::ChunkPage { alloc_offset } => alloc_offset | CHUNK_ALLOC_FLAG,
             PageKind::AllocPage { size } => size,
         };
         unsafe { self.0.cast::<usize>().write(raw); }
@@ -28,10 +30,15 @@ impl PageRef {
     pub fn kind(&self) -> PageKind {
         let raw = unsafe { self.0.cast::<usize>().read() };
         if raw & CHUNK_ALLOC_FLAG != 0 {
-            PageKind::ChunkPage { alloc_page_offset: raw & DATA_MASK }
+            PageKind::ChunkPage { alloc_offset: raw & DATA_MASK }
         } else {
             PageKind::AllocPage { size: raw }
         }
+    }
+
+    #[inline]
+    pub fn into_content_start(self) -> *mut () {
+        unsafe { self.0.cast::<usize>().add(1).cast::<()>() }
     }
 
 }
@@ -43,9 +50,9 @@ const DATA_MASK: usize = !FLAGS_MASK;
 #[derive(Clone, Copy)]
 pub enum PageKind {
     ChunkPage {
-        /// the offset to the left side in unit of pages
+        /// the offset to the left side in unit of bytes
         /// to the page containing the central allocation.
-        alloc_page_offset: usize,
+        alloc_offset: usize,
     },
     AllocPage {
         /// the size of the allocation that starts at this page.
@@ -56,9 +63,9 @@ pub enum PageKind {
 impl PageKind {
 
     #[inline]
-    pub fn offset_pages(&self) -> usize {
+    pub fn offset(&self) -> usize {
         match self {
-            PageKind::ChunkPage { alloc_page_offset } => *alloc_page_offset,
+            PageKind::ChunkPage { alloc_offset } => *alloc_offset,
             PageKind::AllocPage { .. } => core::intrinsics::abort(),
         }
     }
@@ -74,7 +81,7 @@ impl PageKind {
     #[inline]
     fn into_raw(self) -> usize {
         match self {
-            PageKind::ChunkPage { alloc_page_offset } => alloc_page_offset | CHUNK_ALLOC_FLAG,
+            PageKind::ChunkPage { alloc_offset } => alloc_offset | CHUNK_ALLOC_FLAG,
             PageKind::AllocPage { size } => size,
         }
     }

@@ -1,14 +1,16 @@
 use core::arch::asm;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::mem::{align_of, MaybeUninit, transmute};
+use std::mem::{align_of, MaybeUninit, transmute, size_of};
 use std::ptr::null_mut;
-use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, MREMAP_MAYMOVE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf, pthread_setspecific};
-use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_PADDING, ALLOC_FULL_INITIAL_METADATA_SIZE, alloc_chunk_start, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
+use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
+use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_PADDING, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
+use crate::page_ref::PageRef;
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of};
 
 use self::bit_map_list::BitMapList;
+use self::global_free_list::GlobalFreeList;
 
 // FIXME: reuse allocations and maybe use sbrk
 
@@ -16,15 +18,42 @@ const NOT_PRESENT: usize = 0;
 
 static PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
 
-static FREE_CHUNK_ROOT: AtomicPtr<()> = AtomicPtr::new(null_mut()); // this is the root for the implicit global RB-tree
+static GLOBAL_FREE_LIST: GlobalFreeList = GlobalFreeList::new(); // this is the root for the implicit global RB-tree
 
-/// `chunk_start` indicates the start of the chunk (including metadata)
-/// `size` indicates the chunk size in bytes
-fn push_free_chunk(chunk_start: *mut u8, size: usize) {
-    let curr_start_chunk = FREE_CHUNK_ROOT.load(Ordering::Acquire).cast::<u8>();
-    if curr_start_chunk.is_null() {
-        FREE_CHUNK_ROOT.store(chunk_start.cast::<_>(), Ordering::Release);
-        return;
+mod global_free_list {
+    use std::{ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
+
+    use crate::{page_ref::PageRef, alloc_ref::AllocRef};
+
+
+    pub(crate) struct GlobalFreeList {
+        root: AtomicPtr<()>,
+    }
+
+    impl GlobalFreeList {
+
+        #[inline]
+        pub const fn new() -> Self {
+            Self {
+                root: AtomicPtr::new(null_mut()),
+            }
+        }
+
+        #[inline]
+        pub fn is_empty(&self) -> bool {
+            self.root.load(Ordering::Acquire).is_null()
+        }
+
+        /// `chunk_start` indicates the start of the chunk (including metadata)
+        /// `size` indicates the chunk size in pages
+        pub fn push_free_chunk(&self, chunk_start: *mut u8, size: usize) {
+            let page_ref = unsafe { PageRef::from_page_ptr(chunk_start.cast::<()>()) };
+            let alloc_ref = unsafe { AllocRef::new_start(page_ref.into_content_start().cast::<u8>()) };
+            let next_ptr = unsafe { alloc_ref.into_chunk_start().cast::<usize>() };
+            let mut curr_start_chunk = self.root.load(Ordering::Acquire);
+            
+        }
+
     }
 
 }
@@ -79,13 +108,19 @@ pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u8)) {
 }
 
 #[thread_local]
-static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache {
-    buckets: construct_buckets(),
-    free_chunk_root: null_mut(),
-};
+static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
 
 fn cleanup_tls() {
-    
+    // we store the metadata about the size and next ptr in the allocations themselves
+    // this means that we will trash the cache more and we have to fetch more things into
+    // it but we don't have to use as much memory. // FIXME: is this tradeoff worth it?
+    let mut chunk = LOCAL_CACHE.free_chunk_root;
+    while !chunk.is_null() {
+        let page = unsafe { PageRef::from_page_ptr(chunk) };
+        let alloc = AllocRef::new_start(page.into_content_start().cast::<u8>());
+        let size = alloc.read_size() / get_page_size(); // FIXME: should the size value already be stored in multiples of page size inside the alloc?
+
+    }
 }
 
 // static NOT_SETUP_SENTINEL: u8 = 0;
@@ -101,6 +136,21 @@ struct ThreadLocalCache {
 unsafe impl Send for ThreadLocalCache {}
 unsafe impl Sync for ThreadLocalCache {}
 
+impl ThreadLocalCache {
+
+    pub const fn new() -> Self {
+        Self {
+            buckets: construct_buckets(),
+            free_chunk_root: null_mut(),
+        }
+    }
+
+    pub fn push_free_chunk(&mut self, chunk: *mut ()) {
+        
+    }
+
+}
+
 #[inline]
 pub(crate) fn get_page_size() -> usize {
     let cached = PAGE_SIZE.load(Ordering::Relaxed);
@@ -109,7 +159,7 @@ pub(crate) fn get_page_size() -> usize {
     }
     setup_page_size()
 }
-// 
+
 #[cold]
 #[inline(never)]
 fn setup_page_size() -> usize {
@@ -125,8 +175,17 @@ pub fn alloc(size: usize) -> *mut u8 {
     if size > page_size {
         return alloc_chunked(size);
     }
-    
+    let bin_idx = bin_idx(size);
+    let bucket = &LOCAL_CACHE.buckets[bin_idx];
 }
+
+#[inline]
+fn bin_idx(size: usize) -> usize {
+    // FIXME: support bins in between larger powers of two that are themselves non-power of two bins.
+    let rounded_up = size.next_power_of_two();
+    (rounded_up.leading_zeros() - size_of::<usize>().leading_zeros()) as usize
+}
+
 
 fn alloc_chunked(size: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
@@ -142,7 +201,7 @@ fn alloc_chunked(size: usize) -> *mut u8 {
     }
     let mut alloc = AllocRef::new_start(alloc_ptr);
     alloc.setup(full_size, size + CHUNK_METADATA_SIZE);
-    let chunk_start = unsafe { alloc_chunk_start(alloc_ptr) };
+    let chunk_start = unsafe { alloc.into_chunk_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
     if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING + CHUNK_METADATA_SIZE {
@@ -485,21 +544,21 @@ mod bit_map_list {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, readonly, preserve_flags)); }
+    unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
     res
 }
 
 #[cfg(all(target_arch = "x86", target_os = "linux"))]
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, readonly, preserve_flags)); }
+    unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
     res
 }
 
 #[cfg(all(target_arch = "aarch64"))] // FIXME: does this actually work on linux and is it specific to linux?
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mrs {}, TPIDR_EL0", out(reg) res); }
+    unsafe { asm!("mrs {}, TPIDR_EL0", out(reg) res); } // TODO: add some assembly options
     res
 }
 
@@ -507,6 +566,6 @@ fn thread_identifier() -> usize {
 #[cfg(all(target_arch = "arm"))] // FIXME: does this actually work on linux and is it specific to linux?
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mrc p15, 0, {}, c13, c0, 2", out(reg) res); }
+    unsafe { asm!("mrc p15, 0, {}, c13, c0, 2", out(reg) res); } // TODO: add some assembly options
     res
 }*/

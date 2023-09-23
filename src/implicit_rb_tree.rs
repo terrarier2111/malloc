@@ -38,7 +38,7 @@ use std::cmp::Ordering;
                     self.root = Some(unsafe { create_tree_node(key, addr, Color::Black, None) });
                 }
                 Some(root) => {
-                    unsafe { root.tree_node_mut() }.insert(key, addr);
+                    unsafe { root.tree_node_mut() }.insert(key, addr, root.raw_ptr());
                 }
             }
         }
@@ -190,27 +190,29 @@ use std::cmp::Ordering;
             self.left.is_some() || self.right.is_some()
         }
 
-        fn insert(&mut self, key: usize, addr: NonNull<()>) {
+        // FIXME: should we really pass an additional root argument around or should we instead just
+        // re-read the root node from the TLS?
+        fn insert(&mut self, key: usize, addr: NonNull<()>, root: *mut ImplicitRbTreeNode) {
             if self.key < key {
                 if let Some(right) = self.right {
-                    unsafe { right.tree_node_mut().insert(key, addr); }
+                    unsafe { right.tree_node_mut().insert(key, addr, root); }
                     return;
                 }
                 let node = unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) };
                 self.right = Some(node);
-                Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>());
+                Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>(), root);
                 return;
             }
             if let Some(left) = self.left {
-                unsafe { left.tree_node_mut().insert(key, addr); }
+                unsafe { left.tree_node_mut().insert(key, addr, root); }
                 return;
             }
             let node = unsafe { create_tree_node(key, addr, Color::Red, Some(ImplicitRbTreeNodeRef(unsafe { NonNull::new_unchecked((self as *mut ImplicitRbTreeNode).cast::<()>()) }))) };
             self.left = Some(node);
-            Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>());
+            Self::recolor_node(node.0.as_ptr().cast::<ImplicitRbTreeNode>(), root);
         }
 
-        fn recolor_node(mut node: *mut ImplicitRbTreeNode) {
+        fn recolor_node(mut node: *mut ImplicitRbTreeNode, root: *mut ImplicitRbTreeNode) {
             let mut curr_node = node;
             while let Some(parent) = unsafe { curr_node.as_ref().unwrap_unchecked() }.parent_ptr() {
                 if unsafe { parent.tree_node() }.is_black() {
@@ -237,7 +239,7 @@ use std::cmp::Ordering;
                     unreachable!();
                 }
             }
-            // TODO: recolor root node!
+            unsafe { &mut *root }.set_color(Color::Black);
         }
 
         fn rotate_right(&mut self) {

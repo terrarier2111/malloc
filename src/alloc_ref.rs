@@ -75,6 +75,11 @@ pub(crate) unsafe fn alloc_chunk_start(alloc: *mut u8) -> *mut u8 {
             AllocRef::new_end(unsafe { self.0.add(size) })
         }
 
+        #[inline]
+        pub(crate) unsafe fn into_chunk_start(self) -> *mut u8 {
+            self.0.add(ALLOC_METADATA_SIZE_ONE_SIDE)
+        }
+
     }
 
     impl AllocRef<false> {
