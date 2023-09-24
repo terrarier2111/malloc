@@ -1,6 +1,8 @@
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, size_of, transmute};
 
 use crossbeam_utils::CachePadded;
+
+use crate::util::abort;
 
 mod linux;
 
@@ -43,7 +45,7 @@ pub fn realloc(ptr: *mut u8, old_size: usize, new_size: usize, new_align: usize)
     if cfg!(target_os = "linux") {
         linux::realloc(ptr, old_size, new_size, new_align)
     } else {
-        core::intrinsics::abort();
+        abort()
     }
 }
 
@@ -51,7 +53,15 @@ pub(crate) fn get_page_size() -> usize {
     if cfg!(target_os = "linux") {
         linux::get_page_size()
     } else {
-        core::intrinsics::abort();
+        abort()
+    }
+}
+
+pub(crate) unsafe fn register_thread_local_dtor<T>(object: *mut T, dtor: unsafe extern "C" fn(*mut T)) {
+    if cfg!(target_os = "linux") {
+        linux::register_dtor(object.cast::<u8>(), transmute::<unsafe extern "C" fn(*mut T), unsafe extern "C" fn(*mut u8)>(dtor));
+    } else {
+        abort()
     }
 }
 

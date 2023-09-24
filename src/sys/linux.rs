@@ -58,6 +58,11 @@ mod global_free_list {
 
 }
 
+pub(crate) unsafe fn register_thread_local_dtor(dtor: unsafe fn(*mut u8)) {
+    let thread_local = ;
+}
+
+
 // Provides thread-local destructors without an associated "key", which
 // can be more efficient.
 
@@ -68,7 +73,7 @@ mod global_free_list {
 // Note, however, that we run on lots older linuxes, as well as cross
 // compiling from a newer linux to an older linux, so we also have a
 // fallback implementation to use as well.
-pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u8)) {
+pub(crate) unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u8)) {
     use core::mem;
 
     extern "C" {

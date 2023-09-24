@@ -50,7 +50,7 @@ use std::cmp::Ordering;
             if !root.has_children() {
                 return unsafe { self.root.take().map(|node| node.0) }; // FIXME: should we return the data ptr instead?
             }
-            Some(unsafe { root.remove(key) })
+            Some(unsafe { root.remove(key, &mut self.root as *mut Option<ImplicitRbTreeNodeRef>) })
         }
 
         pub fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
@@ -163,6 +163,15 @@ use std::cmp::Ordering;
         #[inline]
         pub(crate) fn set_color(&mut self, color: Color) {
             self.parent = self.parent.map_addr(|raw| (raw & PTR_MASK) | color as usize);
+        }
+
+        #[inline]
+        pub(crate) fn get_color(&self) -> Color {
+            if self.is_red() {
+                Color::Red
+            } else {
+                Color::Black
+            }
         }
 
         #[inline]
@@ -349,22 +358,63 @@ use std::cmp::Ordering;
             (child.rev(), Some(parent.rev()))
         }
 
-        unsafe fn remove(&mut self, key: usize) -> NonNull<()> {
+        unsafe fn remove(&mut self, key: usize, own_ptr: *mut Option<ImplicitRbTreeNodeRef>) -> NonNull<()> {
             if self.key < key {// FIXME: check if key matches with right or left!
                 let mut right = unsafe { self.right.unwrap().tree_node_mut() };
                 if right.key == key {
-                    // FIXME: remove right
-                    return todo!();
+                    let right = self.right.unwrap_unchecked().raw_ptr();
+                    unsafe { Self::inner_removal(right, own_ptr); }
+                    return unsafe { NonNull::new_unchecked(right.cast::<()>()) };
                 }
-                right.remove(key)
+                right.remove(key, &mut self.right as *mut Option<ImplicitRbTreeNodeRef>)
             } else {
                 let left = unsafe { self.left.unwrap().tree_node_mut() };
                 if left.key == key {
-                    // FIXME: remove left
-                    return todo!();
+                    let left = self.left.unwrap_unchecked().raw_ptr();
+                    unsafe { Self::inner_removal(left, own_ptr); }
+                    return unsafe { NonNull::new_unchecked(left.cast::<()>()) };
                 }
-                left.remove(key)
+                left.remove(key, &mut self.left as *mut Option<ImplicitRbTreeNodeRef>)
             }
+        }
+
+        unsafe fn inner_removal(node: *mut ImplicitRbTreeNode, parent: *mut Option<ImplicitRbTreeNodeRef>) {
+            let mut original_color = unsafe { &*node }.get_color();
+            if unsafe { &*node }.left.is_none() {
+                let right = unsafe { &*node }.right;
+                unsafe { *parent = right; }
+            } else if unsafe { &*node }.right.is_none() {
+                let left = unsafe { &*node }.left;
+                unsafe { *parent = left; }
+            } else {
+                // FIXME: this whole branch is REALLY sus, audit it properly!
+                let right = unsafe { &*node }.right;
+                let (new_node, deep) = {
+                    let mut result = unsafe { right.unwrap_unchecked() };
+                    let mut deep = false;
+                    while let Some(left) = unsafe { result.tree_node().left } {
+                        result = left;
+                        deep = true;
+                    }
+                    (result, deep)
+                };
+                let new_color = unsafe { new_node.tree_node() }.get_color();
+                unsafe { new_node.tree_node_mut() }.set_color(original_color); // FIXME: is this step correct at this place?
+                original_color = new_color;
+                let child = unsafe { new_node.tree_node() }.right;
+                if !deep {
+                    // y = y ?
+                } else {
+                    unsafe { new_node.tree_node().parent_ptr().unwrap_unchecked().tree_node_mut().left = child; }
+                }
+            }
+            if original_color == Color::Black {
+                Self::fixup_removal(node);
+            }
+        }
+
+        unsafe fn fixup_removal(node: *mut ImplicitRbTreeNode) {
+
         }
 
         fn find_approx_ge(&self, approx_key: usize) -> Option<ImplicitRbTreeNodeRef> {
