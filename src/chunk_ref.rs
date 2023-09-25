@@ -1,5 +1,7 @@
 use std::mem::size_of;
 
+use crate::util::abort;
+
 pub(crate) const CHUNK_METADATA_SIZE: usize = CHUNK_METADATA_SIZE_ONE_SIDE * 2;
 pub(crate) const CHUNK_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
 
@@ -10,6 +12,26 @@ const LAST_CHUNK_FLAG: usize = 1 << 1;
 const FREE_CHUNK_FLAG: usize = 1 << 2;
 const METADATA_MASK: usize = FIRST_CHUNK_FLAG | LAST_CHUNK_FLAG | FREE_CHUNK_FLAG;
 const SIZE_MASK: usize = !METADATA_MASK;
+
+#[derive(Clone, Copy)]
+pub enum ChunkKind {
+    Offset {
+        offset: usize,
+    },
+    Alloc,
+}
+
+impl ChunkKind {
+
+    #[inline]
+    pub fn offset(self) -> usize {
+        match self {
+            ChunkKind::Offset { offset } => offset,
+            ChunkKind::Alloc => abort(),
+        }
+    }
+
+}
 
 /// `START` indicates whether the stored reference is a reference to the chunk's start or end.
 #[derive(Copy, Clone)]

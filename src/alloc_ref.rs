@@ -14,6 +14,11 @@ pub(crate) const ALLOC_FULL_INITIAL_METADATA_PADDING: usize = {
     }
 };
 
+// FIXME: get rid of the right part of the metadata
+
+// FIXME: also we don't really need max_chunk_size anymore as the chunks have to know themselves when they are free
+// and we will insert all free chunks into thread local caches.
+
 #[inline]
 pub(crate) unsafe fn alloc_chunk_start(alloc: *mut u8) -> *mut u8 {
     alloc.add(ALLOC_METADATA_SIZE_ONE_SIDE)
