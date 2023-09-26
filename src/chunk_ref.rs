@@ -1,37 +1,19 @@
 use std::mem::size_of;
 
-use crate::util::abort;
+// just note that if we have to align the content of a chunk to more than 2 words, we have to set another flag (maybe via a combination of LAST, FIRST and FREE flags)
+// to the word before said chunk (if there isn't enough space for a useful chunk beforehand). Said word beforehand represents a 'ghost chunk' i.e a chunk without any
+// payload and with just one word of metadata.
+
 
 pub(crate) const CHUNK_METADATA_SIZE: usize = CHUNK_METADATA_SIZE_ONE_SIDE * 2;
 pub(crate) const CHUNK_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
 
-
-// FIXME: ensure that we have alignment >= 8
+// FIXME: ensure that we have alignment >= 4
 const FIRST_CHUNK_FLAG: usize = 1 << 0;
 const LAST_CHUNK_FLAG: usize = 1 << 1;
-const FREE_CHUNK_FLAG: usize = 1 << 2;
+const FREE_CHUNK_FLAG: usize = 1 << (usize::BITS - 1);
 const METADATA_MASK: usize = FIRST_CHUNK_FLAG | LAST_CHUNK_FLAG | FREE_CHUNK_FLAG;
 const SIZE_MASK: usize = !METADATA_MASK;
-
-#[derive(Clone, Copy)]
-pub enum ChunkKind {
-    Offset {
-        offset: usize,
-    },
-    Alloc,
-}
-
-impl ChunkKind {
-
-    #[inline]
-    pub fn offset(self) -> usize {
-        match self {
-            ChunkKind::Offset { offset } => offset,
-            ChunkKind::Alloc => abort(),
-        }
-    }
-
-}
 
 /// `START` indicates whether the stored reference is a reference to the chunk's start or end.
 #[derive(Copy, Clone)]

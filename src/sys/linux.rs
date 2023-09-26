@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::mem::{align_of, size_of};
 use std::ptr::null_mut;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
-use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_PADDING, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
+use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::page_ref::PageRef;
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
@@ -57,11 +57,6 @@ mod global_free_list {
     }
 
 }
-
-pub(crate) unsafe fn register_thread_local_dtor(dtor: unsafe fn(*mut u8)) {
-    let thread_local = ;
-}
-
 
 // Provides thread-local destructors without an associated "key", which
 // can be more efficient.
@@ -215,11 +210,11 @@ fn alloc_chunked(size: usize) -> *mut u8 {
         return alloc_ptr;
     }
     let mut alloc = AllocRef::new_start(alloc_ptr);
-    alloc.setup(full_size, size + CHUNK_METADATA_SIZE);
+    alloc.setup(full_size);
     let chunk_start = unsafe { alloc.into_chunk_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
-    if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + ALLOC_FULL_INITIAL_METADATA_PADDING + CHUNK_METADATA_SIZE {
+    if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + CHUNK_METADATA_SIZE {
         let mut last_chunk = ChunkRef::new_start(chunk.into_end(size + CHUNK_METADATA_SIZE).into_raw());
         last_chunk.setup(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE), false, true);
         last_chunk.set_free(true);
@@ -239,7 +234,7 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
         return alloc_ptr;
     }
     let mut alloc = AllocRef::new_start(alloc_ptr);
-    alloc.setup(full_size, size);
+    alloc.setup(full_size);
     let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
     if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
         desired_chunk_start = unsafe { desired_chunk_start.add(size) };

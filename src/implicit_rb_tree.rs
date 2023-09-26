@@ -45,7 +45,7 @@ use std::cmp::Ordering;
             }
         }
 
-        pub fn remove(&mut self, key: usize) -> Option<NonNull<()>> {
+        pub fn remove(&mut self, key: usize) -> Option<NonNull<()>> { // FIXME: support removal of ptrs instead of keys!
             let root = unsafe { self.root.as_mut().unwrap().tree_node_mut() };
             if !root.has_children() {
                 return unsafe { self.root.take().map(|node| node.0) }; // FIXME: should we return the data ptr instead?
@@ -113,10 +113,10 @@ use std::cmp::Ordering;
     #[repr(align(2))]
     #[repr(C)]
     pub struct ImplicitRbTreeNode {
+        key: usize,
         parent: *mut (),
         left: Option<ImplicitRbTreeNodeRef>,
         right: Option<ImplicitRbTreeNodeRef>,
-        key: usize,
     }
 
     impl ImplicitRbTreeNode {
@@ -124,20 +124,20 @@ use std::cmp::Ordering;
         #[inline]
         unsafe fn new_red(parent: ImplicitRbTreeNodeRef, key: usize) -> Self {
             Self {
+                key,
                 parent: parent.0.as_ptr().map_addr(|addr| addr | RED),
                 left: None,
                 right: None,
-                key,
             }
         }
 
         #[inline]
         unsafe fn new_black(parent: ImplicitRbTreeNodeRef, key: usize) -> Self {
             Self {
+                key,
                 parent: parent.0.as_ptr().map_addr(|addr| addr | BLACK),
                 left: None,
                 right: None,
-                key,
             }
         }
 
@@ -261,7 +261,7 @@ use std::cmp::Ordering;
                             unsafe { &mut *parent.tree_node_mut() }.set_color(Color::Black);
                         },
                     }
-                    unsafe { &mut *gp.tree_node() }.set_color(Color::Red);
+                    unsafe { &mut *gp.tree_node_mut() }.set_color(Color::Red);
                     // try checking the next node
                     if let Some(next_check) = unsafe { curr_node.as_ref().unwrap_unchecked() }.parent_ptr() {
                         curr_node = next_check.raw_ptr();
