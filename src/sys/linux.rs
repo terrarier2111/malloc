@@ -16,8 +16,6 @@ use self::local_cache::ThreadLocalCache;
 
 const NOT_PRESENT: usize = 0;
 
-static PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
-
 static GLOBAL_FREE_LIST: GlobalFreeList = GlobalFreeList::new(); // this is the root for the implicit global RB-tree
 
 mod global_free_list {
@@ -46,11 +44,10 @@ mod global_free_list {
 
         /// `chunk_start` indicates the start of the chunk (including metadata)
         /// `size` indicates the chunk size in pages
-        pub fn push_free_chunk(&self, chunk_start: *mut u8, size: usize) {
-            let page_ref = unsafe { PageRef::from_page_ptr(chunk_start.cast::<()>()) };
-            let alloc_ref = unsafe { AllocRef::new_start(page_ref.into_content_start().cast::<u8>()) };
+        pub fn push_free_alloc(&self, alloc_start: *mut u8, size: usize) {
+            let alloc_ref = unsafe { AllocRef::new_start(alloc_start.cast::<u8>()) };
             let next_ptr = unsafe { alloc_ref.into_chunk_start().cast::<usize>() };
-            let mut curr_start_chunk = self.root.load(Ordering::Acquire);
+            let mut curr_start_alloc = self.root.load(Ordering::Acquire);
             
         }
 
@@ -107,7 +104,7 @@ fn cleanup_tls() {
     while let Some(chunk) = chunk_ref {
         let page = unsafe { PageRef::from_page_ptr(chunk.raw_ptr().cast::<()>()) };
         let alloc = AllocRef::new_start(page.into_content_start().cast::<u8>());
-        let size = alloc.read_size() / get_page_size(); // FIXME: should the size value already be stored in multiples of page size inside the alloc?
+        let size = alloc.read_size() / PAGE_SIZE; // FIXME: should the size value already be stored in multiples of page size inside the alloc?
 
     }
 }
@@ -161,9 +158,15 @@ mod local_cache {
     }
 }
 
+/// we use an internal page size of 64KB this should be large enough for any
+/// non-huge native page size.
+const PAGE_SIZE: usize = 1024 * 64;
+
+static OS_PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
+
 #[inline]
 pub(crate) fn get_page_size() -> usize {
-    let cached = PAGE_SIZE.load(Ordering::Relaxed);
+    let cached = OS_PAGE_SIZE.load(Ordering::Relaxed);
     if cached != NOT_PRESENT {
         return cached;
     }
@@ -174,19 +177,24 @@ pub(crate) fn get_page_size() -> usize {
 #[inline(never)]
 fn setup_page_size() -> usize {
     let resolved = unsafe { sysconf(_SC_PAGESIZE) as usize };
-    PAGE_SIZE.store(resolved, Ordering::Relaxed);
+    OS_PAGE_SIZE.store(resolved, Ordering::Relaxed);
     resolved
 }
 
 /// returns memory aligned to ptr size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
-    let page_size = get_page_size();
-    if size > page_size {
+    if size > PAGE_SIZE {
         return alloc_chunked(size);
     }
     let bin_idx = bin_idx(size);
     let bucket = &LOCAL_CACHE.buckets[bin_idx];
+    if let Some(entry) = bucket.alloc_free_entry() {
+        return entry.into_raw().cast::<u8>().as_ptr();
+    }
+    // FIXME: reuse cached pages!
+    let node = map_memory(); // FIXME: map full internal page in rounded up number of required OS-pages!
+    bucket.insert_node(node);
 }
 
 #[inline]
@@ -199,9 +207,8 @@ fn bin_idx(size: usize) -> usize {
 
 fn alloc_chunked(size: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
-    let page_size = get_page_size();
 
-    let full_size = round_up_to_multiple_of(size + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
+    let full_size = round_up_to_multiple_of(size + ALLOC_FULL_INITIAL_METADATA_SIZE, PAGE_SIZE);
 
     println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
@@ -227,8 +234,7 @@ fn alloc_chunked(size: usize) -> *mut u8 {
 #[inline]
 pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
-    let page_size = get_page_size();
-    let full_size = round_up_to_multiple_of(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, page_size);
+    let full_size = round_up_to_multiple_of(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, PAGE_SIZE);
     let alloc_ptr = map_memory(full_size);
     if alloc_ptr.is_null() {
         return alloc_ptr;
@@ -288,7 +294,7 @@ pub fn dealloc(ptr: *mut u8) {
     } else if chunk.is_last() {
         println!("last chunk!");
         // FIXME: try merging with left chunk
-        let alloc = AllocRef::new_end(unsafe { chunk.into_end(chunk_size).into_raw().add(ALLOC_METADATA_SIZE_ONE_SIDE) });
+        let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE_ONE_SIDE) });
         let alloc_size = alloc.read_size();
         let mut left_chunk = ChunkRef::new_end(unsafe { alloc.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         if !left_chunk.is_free() {
@@ -298,7 +304,7 @@ pub fn dealloc(ptr: *mut u8) {
         }
         let overall_size = chunk_size + left_chunk.read_size();
         if overall_size + ALLOC_METADATA_SIZE == alloc_size {
-            unmap_memory(alloc.into_start(alloc_size).into_raw(), alloc_size);
+            unmap_memory(alloc.into_raw(), alloc_size);
             return;
         }
         left_chunk.set_last(true); // FIXME: just update left metadata
@@ -495,8 +501,18 @@ mod bit_map_list {
     const SUB_MAPS_SLOTS_COMBINED: usize = (NODE_SLOTS - SUB_MAPS) * 8;
     const SUB_MAP_SLOTS: usize = min(usize::BITS as usize, CACHE_LINE_SIZE);
 
+    #[derive(Clone, Copy)]
     pub(crate) struct BitMapEntry {
         ptr: NonNull<()>,
+    }
+
+    impl BitMapEntry {
+
+        #[inline]
+        pub fn into_raw(self) -> NonNull<()> {
+            self.ptr
+        }
+
     }
 
     pub(crate) struct BitMapListNode {
