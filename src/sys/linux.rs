@@ -6,13 +6,16 @@ use std::ptr::null_mut;
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
-use crate::page_ref::PageRef;
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
 
+use self::bit_map_list::BitMapListNode;
 use self::global_free_list::GlobalFreeList;
 use self::local_cache::ThreadLocalCache;
 
 // FIXME: reuse allocations and maybe use sbrk
+
+// FIXME: try avoiding atomic instructions if the freeing thread is the same as the original thread.
+// FIXME: we could do this by having 2 bitsets (1 for non-atomic local frees and 1 for atomic non-local frees)
 
 const NOT_PRESENT: usize = 0;
 
@@ -21,7 +24,7 @@ static GLOBAL_FREE_LIST: GlobalFreeList = GlobalFreeList::new(); // this is the 
 mod global_free_list {
     use std::{ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
 
-    use crate::{page_ref::PageRef, alloc_ref::AllocRef};
+    use crate::{alloc_ref::AllocRef};
 
 
     pub(crate) struct GlobalFreeList {
@@ -102,8 +105,7 @@ fn cleanup_tls() {
     // FIXME: is this tradeoff worth it?
     let mut chunk_ref = LOCAL_CACHE.free_chunk_root.root_ref();
     while let Some(chunk) = chunk_ref {
-        let page = unsafe { PageRef::from_page_ptr(chunk.raw_ptr().cast::<()>()) };
-        let alloc = AllocRef::new_start(page.into_content_start().cast::<u8>());
+        let alloc = AllocRef::new_start(chunk.raw_ptr().cast::<u8>());
         let size = alloc.read_size() / PAGE_SIZE; // FIXME: should the size value already be stored in multiples of page size inside the alloc?
 
     }
@@ -117,9 +119,7 @@ mod local_cache {
 
     use crate::implicit_rb_tree::ImplicitRbTree;
 
-    use super::bit_map_list::BitMapList;
-
-    const BUCKETS: usize = 10;
+    use super::bit_map_list::BitMapList;const BUCKETS: usize = 10;
     const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
     const fn construct_buckets() -> [BitMapList; BUCKETS] {
@@ -158,11 +158,17 @@ mod local_cache {
     }
 }
 
+const BUCKETS: usize = 10;
+const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
+
 /// we use an internal page size of 64KB this should be large enough for any
 /// non-huge native page size.
 const PAGE_SIZE: usize = 1024 * 64;
+const SUPER_ALLOC_SIZE: usize = PAGE_SIZE * 256; // FIXME: adjust this number!
 
 static OS_PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
+static PAGE_OS_PAGE_CNT: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
 
 #[inline]
 pub(crate) fn get_page_size() -> usize {
@@ -173,18 +179,28 @@ pub(crate) fn get_page_size() -> usize {
     setup_page_size()
 }
 
+#[inline]
+pub(crate) fn get_page_in_os_page_cnt() -> usize {
+    let cached = PAGE_OS_PAGE_CNT.load(Ordering::Relaxed);
+    if cached != NOT_PRESENT {
+        return cached;
+    }
+    PAGE_SIZE.div_ceil(setup_page_size())
+}
+
 #[cold]
 #[inline(never)]
 fn setup_page_size() -> usize {
     let resolved = unsafe { sysconf(_SC_PAGESIZE) as usize };
     OS_PAGE_SIZE.store(resolved, Ordering::Relaxed);
+    PAGE_OS_PAGE_CNT.store(PAGE_SIZE.div_ceil(resolved), Ordering::Relaxed);
     resolved
 }
 
 /// returns memory aligned to ptr size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
-    if size > PAGE_SIZE {
+    if size > LARGEST_BUCKET {
         return alloc_chunked(size);
     }
     let bin_idx = bin_idx(size);
@@ -193,8 +209,10 @@ pub fn alloc(size: usize) -> *mut u8 {
         return entry.into_raw().cast::<u8>().as_ptr();
     }
     // FIXME: reuse cached pages!
-    let node = map_memory(); // FIXME: map full internal page in rounded up number of required OS-pages!
+    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: map full internal page in rounded up number of required OS-pages!
+    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx]);
     bucket.insert_node(node);
+    bucket.alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
 }
 
 #[inline]
