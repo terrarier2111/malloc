@@ -41,7 +41,7 @@ const SIZE_MASK: usize = !METADATA_MASK;
         }
 
         /// this size value actually represents the size of the allocation in case
-        /// of a huge allocation and it contains the element count and in the higher bits it contains the element size of the bucket
+        /// of a huge allocation and it contains the element count and in the higher bits it contains the bucket index
         /// in case of 
         #[inline]
         pub(crate) fn read_size(&self) -> usize {

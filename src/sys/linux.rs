@@ -165,7 +165,6 @@ const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
 /// we use an internal page size of 64KB this should be large enough for any
 /// non-huge native page size.
 const PAGE_SIZE: usize = 1024 * 64;
-const SUPER_ALLOC_SIZE: usize = PAGE_SIZE * 256; // FIXME: adjust this number!
 
 static OS_PAGE_SIZE: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
 static PAGE_OS_PAGE_CNT: AtomicUsize = AtomicUsize::new(NOT_PRESENT);
@@ -439,7 +438,7 @@ mod bit_map_list {
     use crate::sys::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE, get_page_size};
     use crate::util::min;
 
-    use super::{register_dtor};
+    use super::{register_dtor, PAGE_SIZE};
 
     const REGISTERED_FLAG: usize = 1 << (usize::BITS - 1);
 
@@ -542,9 +541,8 @@ mod bit_map_list {
     impl BitMapListNode {
 
         pub(crate) fn create(addr: *mut (), element_size: usize) -> NonNull<Self> {
-            let page_size = get_page_size();
             // FIXME: cache all these values for all used bucket sizes on startup
-            let max_elem_cnt = page_size / element_size;
+            let max_elem_cnt = PAGE_SIZE / element_size;
             let sub_maps = max_elem_cnt.div_ceil(usize::BITS as usize);
             let meta = size_of::<usize>() + size_of::<BitMapListNode>() + sub_maps;
             let elem_cnt = max_elem_cnt - meta.div_ceil(element_size);
