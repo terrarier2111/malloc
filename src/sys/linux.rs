@@ -5,6 +5,7 @@ use std::mem::{align_of, size_of};
 use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
+use crate::chunk_ref::meta::ChunkMeta;
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
 
@@ -208,7 +209,11 @@ pub fn alloc(size: usize) -> *mut u8 {
         return entry.into_raw().cast::<u8>().as_ptr();
     }
     // FIXME: reuse cached pages!
-    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: map full internal page in rounded up number of required OS-pages!
+    let alloc = alloc_bucket(bin_idx);
+    if alloc.is_null() {
+        return alloc;
+    }
+    let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc)).into_start() };
     let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx]);
     bucket.insert_node(node);
     bucket.alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
@@ -220,7 +225,6 @@ fn bin_idx(size: usize) -> usize {
     let rounded_up = size.next_power_of_two();
     (rounded_up.leading_zeros() - size_of::<usize>().leading_zeros()) as usize
 }
-
 
 fn alloc_chunked(size: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
@@ -234,7 +238,7 @@ fn alloc_chunked(size: usize) -> *mut u8 {
         return alloc_ptr;
     }
     let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_ptr) });
-    alloc.read_chunked().setup(full_size);
+    alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_first(true).set_free(false));
     let chunk_start = unsafe { alloc.into_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
@@ -275,6 +279,16 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     last_chunk.set_free(true);
 
     chunk.into_content_start()
+}
+
+#[inline]
+fn alloc_bucket(idx: usize) -> *mut u8 {
+    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: map full internal page in rounded up number of required OS-pages!
+    if alloc.is_null() {
+        return alloc;
+    }
+    AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc) }).setup_bucket(idx);
+    alloc
 }
 
 #[inline]
