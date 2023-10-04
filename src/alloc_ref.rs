@@ -1,6 +1,6 @@
-use std::{mem::size_of, ptr::NonNull};
+use std::{mem::size_of, ptr::NonNull, ops::Sub};
 
-use crate::{chunk_ref::CHUNK_METADATA_SIZE};
+use crate::{chunk_ref::CHUNK_METADATA_SIZE, util::align_unaligned_ptr_up_to};
 
 pub(crate) const ALLOC_METADATA_SIZE: usize = ALLOC_METADATA_SIZE_ONE_SIDE;
 pub(crate) const ALLOC_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
@@ -107,7 +107,6 @@ impl ChunkedAlloc {
             // one option would be to allocate the required amount of memory * 2 + 2 and store the metadata in the page directly before the start ptr
             // and return a ptr to the start of the next page and on dealloc special case such page aligned ptrs to read the metadata from a page before.
             ChunkedAlloc(self.0).setup(size);
-            todo!()
         }
 
         #[inline]
@@ -137,6 +136,20 @@ impl ChunkedAlloc {
 
     }
 
-pub(crate) fn from_base(base: *mut (), size: usize, align: usize,  ) -> (Option<ChunkedAlloc>, ChunkedAlloc, Option<ChunkedAlloc>) {
-
+#[inline]
+pub(crate) fn from_base(base: *mut (), size: usize, align: usize,  req_size: usize) -> (Option<ChunkedAlloc>, ChunkedAlloc, Option<ChunkedAlloc>) {
+    let aligned = unsafe { align_unaligned_ptr_up_to(base.cast::<u8>(), size, align, req_size) };
+    let left = base.cast::<u8>();
+    let right = unsafe { base.cast::<u8>().add(req_size) };
+    let left = if left == aligned {
+        None
+    } else {
+        Some(ChunkedAlloc(unsafe { NonNull::new_unchecked(left) }))
+    };
+    let right = if right == aligned {
+        None
+    } else {
+        Some(ChunkedAlloc(unsafe { NonNull::new_unchecked(right) }))
+    };
+    (left, ChunkedAlloc(unsafe { NonNull::new_unchecked(aligned) }), right)
 }
