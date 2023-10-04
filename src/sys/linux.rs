@@ -2,7 +2,7 @@ use core::arch::asm;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::mem::{align_of, size_of};
-use std::ptr::null_mut;
+use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
 use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
@@ -22,7 +22,7 @@ const NOT_PRESENT: usize = 0;
 static GLOBAL_FREE_LIST: GlobalFreeList = GlobalFreeList::new(); // this is the root for the implicit global RB-tree
 
 mod global_free_list {
-    use std::{ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
+    use std::{ptr::{null_mut, NonNull}, sync::atomic::{AtomicPtr, Ordering}};
 
     use crate::{alloc_ref::AllocRef};
 
@@ -48,8 +48,8 @@ mod global_free_list {
         /// `chunk_start` indicates the start of the chunk (including metadata)
         /// `size` indicates the chunk size in pages
         pub fn push_free_alloc(&self, alloc_start: *mut u8, size: usize) {
-            let alloc_ref = unsafe { AllocRef::new_start(alloc_start.cast::<u8>()) };
-            let next_ptr = unsafe { alloc_ref.into_chunk_start().cast::<usize>() };
+            let alloc_ref = unsafe { AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_start.cast::<u8>()) }) };
+            let next_ptr = unsafe { alloc_ref.into_start().cast::<usize>() };
             let mut curr_start_alloc = self.root.load(Ordering::Acquire);
             
         }
@@ -105,8 +105,8 @@ fn cleanup_tls() {
     // FIXME: is this tradeoff worth it?
     let mut chunk_ref = LOCAL_CACHE.free_chunk_root.root_ref();
     while let Some(chunk) = chunk_ref {
-        let alloc = AllocRef::new_start(chunk.raw_ptr().cast::<u8>());
-        let size = alloc.read_size() / PAGE_SIZE; // FIXME: should the size value already be stored in multiples of page size inside the alloc?
+        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.raw_ptr().cast::<u8>()) });
+        let size = alloc.read_chunked().read_size() / PAGE_SIZE; // FIXME: should the size value already be stored in multiples of page size inside the alloc?
 
     }
 }
@@ -233,9 +233,9 @@ fn alloc_chunked(size: usize) -> *mut u8 {
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
-    let mut alloc = AllocRef::new_start(alloc_ptr);
-    alloc.setup(full_size);
-    let chunk_start = unsafe { alloc.into_chunk_start() };
+    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_ptr) });
+    alloc.read_chunked().setup(full_size);
+    let chunk_start = unsafe { alloc.into_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
     chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
     if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + CHUNK_METADATA_SIZE {
@@ -256,9 +256,9 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
-    let mut alloc = AllocRef::new_start(alloc_ptr);
-    alloc.setup(full_size);
-    let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to::<ALLOC_METADATA_SIZE_ONE_SIDE>(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
+    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_ptr) });
+    alloc.read_chunked().setup(full_size);
+    let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align, ALLOC_METADATA_SIZE_ONE_SIDE).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
     if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
         desired_chunk_start = unsafe { desired_chunk_start.add(size) };
     }
@@ -280,6 +280,10 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 #[inline]
 pub fn dealloc(ptr: *mut u8) {
     println!("start dealloc {:?}", ptr);
+    dealloc_chunked(ptr);
+}
+
+fn dealloc_chunked(ptr: *mut u8) {
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
     println!("chunk size: {} chunk {:?} free {}", chunk_size, unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) }, chunk.is_last());
@@ -289,8 +293,8 @@ pub fn dealloc(ptr: *mut u8) {
         if chunk.is_last() {
             unreachable!();
         }
-        let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
-        let alloc_size = alloc.read_size();
+        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE)) });
+        let alloc_size = alloc.read_chunked().read_size();
         let mut right_chunk = ChunkRef::new_start(chunk.into_end(chunk_size).into_raw());
         if !right_chunk.is_free() {
             println!("only free!");
@@ -301,7 +305,7 @@ pub fn dealloc(ptr: *mut u8) {
         let overall_size = chunk_size + right_chunk.read_size();
         if right_chunk.is_last() {
             println!("unmap {:?}", alloc.into_raw());
-            unmap_memory(alloc.into_raw(), alloc_size);
+            unmap_memory(alloc.into_raw().as_ptr(), alloc_size);
             return;
         }
         right_chunk.set_first(true); // FIXME: just update right metadata
@@ -311,9 +315,9 @@ pub fn dealloc(ptr: *mut u8) {
     } else if chunk.is_last() {
         println!("last chunk!");
         // FIXME: try merging with left chunk
-        let alloc = AllocRef::new_start(unsafe { chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE_ONE_SIDE) });
-        let alloc_size = alloc.read_size();
-        let mut left_chunk = ChunkRef::new_end(unsafe { alloc.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
+        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE_ONE_SIDE)) });
+        let alloc_size = alloc.read_chunked().read_size();
+        let mut left_chunk = ChunkRef::new_end(unsafe { alloc.into_raw().as_ptr().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
         if !left_chunk.is_free() {
             // we can't merge with any other chunk, so we can just mark ourselves as free
             chunk.set_free(true);
@@ -321,7 +325,7 @@ pub fn dealloc(ptr: *mut u8) {
         }
         let overall_size = chunk_size + left_chunk.read_size();
         if overall_size + ALLOC_METADATA_SIZE == alloc_size {
-            unmap_memory(alloc.into_raw(), alloc_size);
+            unmap_memory(alloc.into_raw().as_ptr(), alloc_size);
             return;
         }
         left_chunk.set_last(true); // FIXME: just update left metadata
