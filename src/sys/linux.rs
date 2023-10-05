@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::mem::{align_of, size_of};
 use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
-use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE};
+use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE};
 use crate::chunk_ref::meta::ChunkMeta;
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
@@ -197,7 +197,7 @@ fn setup_page_size() -> usize {
     resolved
 }
 
-/// returns memory aligned to ptr size
+/// returns memory aligned to word size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
     if size > LARGEST_BUCKET {
@@ -241,14 +241,14 @@ fn alloc_chunked(size: usize) -> *mut u8 {
     alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_first(true).set_free(false));
     let chunk_start = unsafe { alloc.into_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
-    chunk.setup(size + CHUNK_METADATA_SIZE, true, false);
+    let mut chunk_meta = ChunkMeta::empty().set_size(size + CHUNK_METADATA_SIZE).set_first(true).set_free(false);
     if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + CHUNK_METADATA_SIZE {
         let mut last_chunk = ChunkRef::new_start(chunk.into_end(size + CHUNK_METADATA_SIZE).into_raw());
-        last_chunk.setup(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE), false, true);
-        last_chunk.set_free(true);
+        last_chunk.setup(ChunkMeta::empty().set_size(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE)).set_first(false).set_last(true).set_free(true));
     } else {
-        chunk.set_last(true);
+        chunk_meta = chunk_meta.set_last(true);
     }
+    chunk.setup(chunk_meta);
     chunk.into_content_start()
 }
 
@@ -283,7 +283,7 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 #[inline]
 fn alloc_bucket(idx: usize) -> *mut u8 {
-    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: map full internal page in rounded up number of required OS-pages!
+    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: align the allocated pages to PAGE_SIZE! (for this we will have to allocate 2 * PAGE_SIZE) pages and dealloc the trailing pages and unaligned pages at the beginning!
     if alloc.is_null() {
         return alloc;
     }
@@ -294,10 +294,28 @@ fn alloc_bucket(idx: usize) -> *mut u8 {
 #[inline]
 pub fn dealloc(ptr: *mut u8) {
     println!("start dealloc {:?}", ptr);
+    // check if we have a large or overaligned allocation
+    if ptr as usize % PAGE_SIZE == 0 {
+        dealloc_large(ptr);
+        return;
+    }
+    let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(ptr) });
+    if alloc.is_bucket() {
+        let alloc = alloc.read_bucket();
+        
+    } else {
+        dealloc_chunked(ptr);
+    }
+}
+
+#[inline]
+fn dealloc_large(ptr: *mut u8) {
+    let ptr = unsafe { ptr.sub(CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE) };
     dealloc_chunked(ptr);
 }
 
 fn dealloc_chunked(ptr: *mut u8) {
+    // FIXME: should we support multiple chunks in the same allocation?
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
     println!("chunk size: {} chunk {:?} free {}", chunk_size, unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) }, chunk.is_last());
@@ -305,7 +323,10 @@ fn dealloc_chunked(ptr: *mut u8) {
     if chunk.is_first() {
         println!("first chunk!");
         if chunk.is_last() {
-            unreachable!();
+            // we are the only chunk, so just cleanup
+            println!("unmap {:?}", chunk.into_raw());
+            unmap_memory(chunk.into_raw(), chunk.read_size());
+            return;
         }
         let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE)) });
         let alloc_size = alloc.read_chunked().read_size();
@@ -326,7 +347,8 @@ fn dealloc_chunked(ptr: *mut u8) {
         right_chunk.update_size(overall_size); // FIXME: just update right metadata
         chunk.update_size(overall_size); // FIXME: just update left metadata
         return;
-    } else if chunk.is_last() {
+    }
+    if chunk.is_last() {
         println!("last chunk!");
         // FIXME: try merging with left chunk
         let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE_ONE_SIDE)) });
@@ -346,9 +368,8 @@ fn dealloc_chunked(ptr: *mut u8) {
         left_chunk.update_size(overall_size); // FIXME: just update left metadata
         chunk.update_size(overall_size); // FIXME: just update right metadata
         return;
-    } else {
-        println!("weird chunk!");
     }
+    println!("weird chunk!");
 }
 
 #[inline]
@@ -491,7 +512,7 @@ mod bit_map_list {
                 self.tail = Some(node);
                 if self.entries & REGISTERED_FLAG == 0 { // FIXME: should we use a sentinel value inside tail instead for optimization purposes?
                     self.entries |= REGISTERED_FLAG;
-                    unsafe { register_dtor(t, dtor); }
+                    // unsafe { register_dtor(t, dtor); } // FIXME: support this!
                 }
                 return;
             }

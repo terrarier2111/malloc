@@ -12,7 +12,6 @@ mod sys;
 mod alloc_ref;
 mod chunk_ref;
 mod implicit_rb_tree;
-mod page_ref;
 
 // #[no_mangle]
 pub fn alloc(size: usize) -> *mut u8 {

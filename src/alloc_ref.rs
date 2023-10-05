@@ -1,10 +1,6 @@
 use std::{mem::size_of, ptr::NonNull};
 
-use crate::{chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, meta::ChunkMeta}, util::align_unaligned_ptr_up_to};
-
-pub(crate) const ALLOC_METADATA_SIZE: usize = ALLOC_METADATA_SIZE_ONE_SIDE;
-pub(crate) const ALLOC_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
-pub(crate) const ALLOC_FULL_INITIAL_METADATA_SIZE: usize = ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE;
+use crate::{chunk_ref::{ChunkRef, meta::ChunkMeta}, util::align_unaligned_ptr_up_to};
 
 // FIXME: also we don't really need max_chunk_size anymore as the chunks have to know themselves when they are free
 // and we will insert all free chunks into thread local caches.
@@ -12,9 +8,14 @@ pub(crate) const ALLOC_FULL_INITIAL_METADATA_SIZE: usize = ALLOC_METADATA_SIZE +
 const BUCKET_TY_FLAG: usize = 1 << (usize::BITS - 1);
 
 
+pub(crate) const CHUNK_ALLOC_METADATA_SIZE: usize = CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE;
+pub(crate) const CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE: usize = size_of::<usize>();
+
 const CHUNK_METADATA_MASK: usize = BUCKET_TY_FLAG;
 const CHUNK_SIZE_MASK: usize = !CHUNK_METADATA_MASK;
 
+
+pub(crate) const BUCKET_METADATA_SIZE: usize = size_of::<usize>() * 2;
 
 const BUCKET_IDX_MASK: usize = 0b1111;
 const REMAINING_ELEM_CNT_MASK: usize = !(BUCKET_IDX_MASK | BUCKET_TY_FLAG); // we store a counter inside the bucket meta that just counts the local free slots as a fast path?
@@ -57,9 +58,13 @@ impl BucketAlloc {
         unsafe { *self.0.as_ptr().cast::<usize>() }
     }
 
+    #[inline]
+    pub(crate) unsafe fn into_start(self) -> *mut u8 {
+        self.0.as_ptr().add(BUCKET_METADATA_SIZE)
+    }
+
 }
 
-// FIXME: the information contained inside this is just redundant as the chunk_ref already contains the size!
 pub(crate) struct ChunkedAlloc(NonNull<u8>);
 
 impl ChunkedAlloc {
@@ -89,6 +94,11 @@ impl ChunkedAlloc {
         let meta = ChunkRef::<true>(self.0.as_ptr()).read_meta().set_size(size);
         ChunkRef::<true>(self.0.as_ptr()).update_size(size);
         ChunkRef::<true>(self.0.as_ptr()).into_end(size).setup_own(meta);
+    }
+
+    #[inline]
+    pub(crate) unsafe fn into_start(self) -> *mut u8 {
+        self.0.as_ptr().add(CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE)
     }
 
 }
@@ -142,11 +152,6 @@ impl ChunkedAlloc {
         #[inline]
         pub(crate) fn is_bucket(&self) -> bool {
             self.read_raw() & BUCKET_TY_FLAG != 0
-        }
-
-        #[inline]
-        pub(crate) unsafe fn into_start(self) -> *mut u8 {
-            self.0.as_ptr().add(ALLOC_METADATA_SIZE_ONE_SIDE)
         }
 
     }
