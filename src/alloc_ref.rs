@@ -1,4 +1,4 @@
-use std::{mem::size_of, ptr::NonNull, ops::Sub};
+use std::{mem::size_of, ptr::NonNull};
 
 use crate::{chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, meta::ChunkMeta}, util::align_unaligned_ptr_up_to};
 
@@ -17,14 +17,12 @@ const CHUNK_SIZE_MASK: usize = !CHUNK_METADATA_MASK;
 
 
 const BUCKET_IDX_MASK: usize = 0b1111;
-const ALLOCED_ELEM_CNT_MASK: usize = !(BUCKET_IDX_MASK | BUCKET_TY_FLAG); // we store a counter inside the bucket meta that just counts the local free slots as a fast path?
+const REMAINING_ELEM_CNT_MASK: usize = !(BUCKET_IDX_MASK | BUCKET_TY_FLAG); // we store a counter inside the bucket meta that just counts the local free slots as a fast path?
 
 #[derive(Clone, Copy)]
 pub struct BucketAlloc(NonNull<u8>);
 
 impl BucketAlloc {
-
-    // FIXME: add free_elem_cnt
 
     #[inline]
     pub(crate) fn into_raw(self) -> *mut u8 {
@@ -36,8 +34,22 @@ impl BucketAlloc {
         self.read_raw() & BUCKET_IDX_MASK
     }
 
+    #[inline]
+    pub(crate) fn read_remaining_elem_cnt(self) -> usize {
+        (self.read_raw() & REMAINING_ELEM_CNT_MASK) >> BUCKET_IDX_MASK.leading_ones()
+    }
+
+    #[inline]
+    pub(crate) fn update_remaining_elem_cnt(self, elem_cnt: usize) {
+        self.write_raw(elem_cnt | (self.read_raw() & !REMAINING_ELEM_CNT_MASK))
+    }
+
     fn setup(self, bucket_idx: usize) {
-        unsafe { self.0.as_ptr().cast::<usize>().write(bucket_idx | BUCKET_TY_FLAG); }
+        self.write_raw(bucket_idx | BUCKET_TY_FLAG);
+    }
+
+    fn write_raw(mut self, val: usize) {
+        unsafe { self.0.as_ptr().cast::<usize>().write(val); }
     }
 
     #[inline]
