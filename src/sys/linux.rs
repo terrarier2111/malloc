@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::mem::{align_of, size_of};
 use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
-use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE};
+use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE, BUCKET_METADATA_SIZE};
 use crate::chunk_ref::meta::ChunkMeta;
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
@@ -12,6 +12,8 @@ use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
 use self::bit_map_list::BitMapListNode;
 use self::global_free_list::GlobalFreeList;
 use self::local_cache::ThreadLocalCache;
+
+use super::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE};
 
 // FIXME: reuse allocations and maybe use sbrk
 
@@ -162,6 +164,32 @@ mod local_cache {
 const BUCKETS: usize = 10;
 const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
+// the first array is for meta size and the second is for elem cnt
+const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
+    let mut ret = ([0; BUCKETS], [0; BUCKETS]);
+    let mut i = 0;
+    while i < BUCKETS {
+        // calculate bucket size by first estimating the meta size and then
+        // iteratively improving our estimate until we have the perfect values.
+        let mut max_elems = PAGE_SIZE / BUCKET_ELEM_SIZES[i];
+        // our metadata consists of a bitmap of used values and another atomic bitmap, which has to be aligned to cache line size.
+        const BUCKET_META_WORD_SIZE: usize = BUCKET_METADATA_SIZE.div_ceil(size_of::<usize>());
+        let unused = PAGE_SIZE % BUCKET_ELEM_SIZES[i];
+        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE - unused / size_of::<usize>()).next_multiple_of(CACHE_LINE_WORD_SIZE);
+        loop {
+            let prev = max_elems;
+            max_elems = (PAGE_SIZE - meta_size * size_of::<usize>()) / BUCKET_ELEM_SIZES[i];
+            // check if we can't improve our estimate, in which case we must already have the perfect values
+            if prev == max_elems {
+                break;
+            }
+            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE - unused / size_of::<usize>()).next_multiple_of(CACHE_LINE_WORD_SIZE);
+        }
+        ret.0[i] = meta_size - BUCKET_META_WORD_SIZE;
+        ret.1[i] = max_elems;
+    }
+    ret
+};
 
 /// we use an internal page size of 64KB this should be large enough for any
 /// non-huge native page size.
