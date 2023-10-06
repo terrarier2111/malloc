@@ -174,8 +174,7 @@ const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
         let mut max_elems = PAGE_SIZE / BUCKET_ELEM_SIZES[i];
         // our metadata consists of a bitmap of used values and another atomic bitmap, which has to be aligned to cache line size.
         const BUCKET_META_WORD_SIZE: usize = BUCKET_METADATA_SIZE.div_ceil(size_of::<usize>());
-        let unused = PAGE_SIZE % BUCKET_ELEM_SIZES[i];
-        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE - unused / size_of::<usize>()).next_multiple_of(CACHE_LINE_WORD_SIZE);
+        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
         loop {
             let prev = max_elems;
             max_elems = (PAGE_SIZE - meta_size * size_of::<usize>()) / BUCKET_ELEM_SIZES[i];
@@ -183,7 +182,7 @@ const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
             if prev == max_elems {
                 break;
             }
-            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE - unused / size_of::<usize>()).next_multiple_of(CACHE_LINE_WORD_SIZE);
+            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
         }
         ret.0[i] = meta_size - BUCKET_META_WORD_SIZE;
         ret.1[i] = max_elems;
