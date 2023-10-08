@@ -103,6 +103,50 @@ impl ChunkedAlloc {
 
 }
 
+/// This kind of allocation is encoded as a free ChunkedAlloc
+/// followed by a next pointer to the next free allocation.
+pub struct FreeAlloc(pub NonNull<u8>);
+
+impl FreeAlloc {
+
+    #[inline]
+    pub(crate) fn setup(&mut self, size: usize) {
+        self.update_size(size);
+    }
+
+    /// returns the size of the allocation in bytes
+    #[inline]
+    pub(crate) fn read_size(&self) -> usize {
+        ChunkRef::<true>(self.0.as_ptr()).read_size()
+    }
+
+    #[inline]
+    pub(crate) fn update_size(&mut self, size: usize) {
+        ChunkRef::<true>(self.0.as_ptr()).update_size(size);
+    }
+
+    #[inline]
+    pub(crate) fn read_next(&mut self) -> *mut FreeAlloc {
+        unsafe { ChunkRef::<true>(self.0.as_ptr()).into_content_start().cast::<*mut FreeAlloc>().read() }
+    }
+
+    #[inline]
+    pub(crate) fn write_next(&mut self, next: *mut FreeAlloc) {
+        unsafe { ChunkRef::<true>(self.0.as_ptr()).into_content_start().cast::<*mut FreeAlloc>().write(next); }
+    }
+
+    #[inline]
+    fn read_meta_raw(&self) -> usize {
+        unsafe { *self.0.as_ptr().cast::<usize>() }
+    }
+
+    #[inline]
+    fn write_meta_raw(&mut self, size: usize) {
+        unsafe { *self.0.as_ptr().cast::<usize>() = size; }
+    }
+
+}
+
 #[derive(Copy, Clone)]
     pub(crate) struct AllocRef(NonNull<u8>);
 
@@ -142,6 +186,11 @@ impl ChunkedAlloc {
         #[inline]
         pub(crate) fn read_chunked(self) -> ChunkedAlloc {
             ChunkedAlloc(self.0)
+        }
+
+        #[inline]
+        pub(crate) fn read_free(self) -> FreeAlloc {
+            FreeAlloc(self.0)
         }
 
         #[inline]

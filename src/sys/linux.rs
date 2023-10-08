@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::mem::{align_of, size_of};
 use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
-use crate::alloc_ref::{AllocRef, ALLOC_FULL_INITIAL_METADATA_SIZE, ALLOC_METADATA_SIZE_ONE_SIDE, ALLOC_METADATA_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE, BUCKET_METADATA_SIZE};
+use crate::alloc_ref::{AllocRef, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE, BUCKET_METADATA_SIZE, CHUNK_ALLOC_METADATA_SIZE, FreeAlloc};
 use crate::chunk_ref::meta::ChunkMeta;
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
@@ -25,9 +25,7 @@ const NOT_PRESENT: usize = 0;
 static GLOBAL_FREE_LIST: GlobalFreeList = GlobalFreeList::new(); // this is the root for the implicit global RB-tree
 
 mod global_free_list {
-    use std::{ptr::{null_mut, NonNull}, sync::atomic::{AtomicPtr, Ordering}};
-
-    use crate::{alloc_ref::AllocRef};
+    use std::{ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
 
 
     pub(crate) struct GlobalFreeList {
@@ -51,14 +49,17 @@ mod global_free_list {
         /// `chunk_start` indicates the start of the chunk (including metadata)
         /// `size` indicates the chunk size in pages
         pub fn push_free_alloc(&self, alloc_start: *mut u8, size: usize) {
-            let alloc_ref = unsafe { AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_start.cast::<u8>()) }) };
-            let next_ptr = unsafe { alloc_ref.into_start().cast::<usize>() };
             let mut curr_start_alloc = self.root.load(Ordering::Acquire);
             
         }
 
     }
 
+}
+
+fn free_global(addr: NonNull<u8>, size: usize) {
+     // FIXME: cache the global memory!
+    unmap_memory(addr.as_ptr(), size);
 }
 
 // Provides thread-local destructors without an associated "key", which
@@ -106,11 +107,13 @@ fn cleanup_tls() {
     // it but we don't have to use as much memory. We have to load 24 bytes (on 64 bit systems)
     // anyways as we have 2 ptrs to children and one key for traversal.
     // FIXME: is this tradeoff worth it?
-    let mut chunk_ref = LOCAL_CACHE.free_chunk_root.root_ref();
-    while let Some(chunk) = chunk_ref {
-        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.raw_ptr().cast::<u8>()) });
-        let size = alloc.read_chunked().read_size() / PAGE_SIZE; // FIXME: should the size value already be stored in multiples of page size inside the alloc?
-
+    let mut chunk_ref = unsafe { LOCAL_CACHE.free_chunk_root.pop_front().cast::<FreeAlloc>() };
+    while !chunk_ref.is_null() {
+        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk_ref.cast::<u8>()) });
+        let size = alloc.read_free().read_size()/* / PAGE_SIZE*/;
+        let next = alloc.read_free().read_next();
+        free_global(alloc.into_raw(), size);
+        chunk_ref = next;
     }
 }
 
@@ -118,9 +121,9 @@ mod local_cache {
 
     // static NOT_SETUP_SENTINEL: u8 = 0;
 
-    use std::mem::{MaybeUninit, transmute};
+    use std::{mem::{MaybeUninit, transmute}, ptr::NonNull};
 
-    use crate::implicit_rb_tree::ImplicitRbTree;
+    use crate::{linked_list::LinkedList, alloc_ref::FreeAlloc};
 
     use super::bit_map_list::BitMapList;const BUCKETS: usize = 10;
     const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
@@ -137,9 +140,10 @@ mod local_cache {
         unsafe { transmute(buckets) }
     }
 
+    #[repr(C)]
     pub(crate) struct ThreadLocalCache {
+        pub(crate) free_chunk_root: LinkedList<usize>/*ImplicitRbTree*/, // this acts as a local cache for free chunks
         pub(crate) buckets: [BitMapList; BUCKETS],
-        pub(crate) free_chunk_root: ImplicitRbTree, // this acts as a local cache for free chunks
     }
 
     unsafe impl Send for ThreadLocalCache {}
@@ -150,12 +154,21 @@ mod local_cache {
         pub const fn new() -> Self {
             Self {
                 buckets: construct_buckets(),
-                free_chunk_root: ImplicitRbTree::new(),
+                free_chunk_root: LinkedList::new(),
             }
         }
 
-        pub fn push_free_chunk(&mut self, chunk: *mut ()) {
-            
+        pub unsafe fn push_free_chunk(&mut self, chunk: *mut (), size: usize) {
+            self.free_chunk_root.push(chunk, size);
+        }
+
+        pub unsafe fn pop_free_chunk(&mut self) -> Option<FreeAlloc> {
+            let ret = self.free_chunk_root.pop_front();
+            if ret.is_null() {
+                None
+            } else {
+                Some(FreeAlloc(unsafe { NonNull::new_unchecked(ret.cast::<u8>()) }))
+            }
         }
 
     }
@@ -165,8 +178,9 @@ const BUCKETS: usize = 10;
 const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
 // the first array is for meta size and the second is for elem cnt
-const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
+const BUCKET_META_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
     let mut ret = ([0; BUCKETS], [0; BUCKETS]);
+    let meta_base_word_size = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
     let mut i = 0;
     while i < BUCKETS {
         // calculate bucket size by first estimating the meta size and then
@@ -174,7 +188,7 @@ const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
         let mut max_elems = PAGE_SIZE / BUCKET_ELEM_SIZES[i];
         // our metadata consists of a bitmap of used values and another atomic bitmap, which has to be aligned to cache line size.
         const BUCKET_META_WORD_SIZE: usize = BUCKET_METADATA_SIZE.div_ceil(size_of::<usize>());
-        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
+        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + meta_base_word_size).next_multiple_of(CACHE_LINE_WORD_SIZE);
         loop {
             let prev = max_elems;
             max_elems = (PAGE_SIZE - meta_size * size_of::<usize>()) / BUCKET_ELEM_SIZES[i];
@@ -182,10 +196,21 @@ const BUCKET_MAP_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
             if prev == max_elems {
                 break;
             }
-            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
+            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + meta_base_word_size).next_multiple_of(CACHE_LINE_WORD_SIZE);
         }
         ret.0[i] = meta_size - BUCKET_META_WORD_SIZE;
         ret.1[i] = max_elems;
+        i += 1;
+    }
+    ret
+};
+const BUCKET_MAP_CNT: [usize; BUCKETS] = {
+    let mut ret = [0; BUCKETS];
+    let meta_base_word_size = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
+    let mut i = 0;
+    while i < BUCKETS {
+        ret[i] = (BUCKET_META_AND_ELEM_CNTS.0[i] - meta_base_word_size) / 2;
+        i += 1;
     }
     ret
 };
@@ -224,6 +249,26 @@ fn setup_page_size() -> usize {
     resolved
 }
 
+fn map_pages(pages: usize) -> *mut u8 {
+    let (size, additional) = if pages == 1 {
+        (2 * PAGE_SIZE, 1)
+    } else {
+        (pages + 2 * PAGE_SIZE, 2)
+    };
+    let raw = map_memory(size);
+    // FIXME: is this fast path actually an improvement?
+    if raw as usize % PAGE_SIZE == 0 {
+        unsafe { LOCAL_CACHE.push_free_chunk(raw.add(pages * PAGE_SIZE).cast::<()>(), additional * PAGE_SIZE); }
+        return raw;
+    }
+    let aligned = unsafe { align_unaligned_ptr_up_to(raw, size, PAGE_SIZE, pages * PAGE_SIZE) };
+    let front = aligned as usize - raw as usize;
+    unmap_memory(raw, front);
+    let back = additional * PAGE_SIZE - front;
+    unmap_memory(unsafe { raw.add(pages * PAGE_SIZE) }, back);
+    aligned
+}
+
 /// returns memory aligned to word size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
@@ -236,12 +281,13 @@ pub fn alloc(size: usize) -> *mut u8 {
         return entry.into_raw().cast::<u8>().as_ptr();
     }
     // FIXME: reuse cached pages!
+
     let alloc = alloc_bucket(bin_idx);
     if alloc.is_null() {
         return alloc;
     }
-    let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc)).into_start() };
-    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx]);
+    let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc)).read_bucket().into_start() };
+    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], e);
     bucket.insert_node(node);
     bucket.alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
 }
@@ -256,7 +302,7 @@ fn bin_idx(size: usize) -> usize {
 fn alloc_chunked(size: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
 
-    let full_size = round_up_to_multiple_of(size + ALLOC_FULL_INITIAL_METADATA_SIZE, PAGE_SIZE);
+    let full_size = round_up_to_multiple_of(size + CHUNK_ALLOC_METADATA_SIZE, PAGE_SIZE);
 
     println!("pre alloc {}", full_size);
     let alloc_ptr = map_memory(full_size);
@@ -266,12 +312,12 @@ fn alloc_chunked(size: usize) -> *mut u8 {
     }
     let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_ptr) });
     alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_first(true).set_free(false));
-    let chunk_start = unsafe { alloc.into_start() };
+    let chunk_start = unsafe { alloc.read_chunked().into_start() };
     let mut chunk = ChunkRef::new_start(chunk_start);
     let mut chunk_meta = ChunkMeta::empty().set_size(size + CHUNK_METADATA_SIZE).set_first(true).set_free(false);
-    if full_size > size + ALLOC_FULL_INITIAL_METADATA_SIZE + CHUNK_METADATA_SIZE {
+    if full_size > size + CHUNK_ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE {
         let mut last_chunk = ChunkRef::new_start(chunk.into_end(size + CHUNK_METADATA_SIZE).into_raw());
-        last_chunk.setup(ChunkMeta::empty().set_size(full_size - (size + ALLOC_FULL_INITIAL_METADATA_SIZE)).set_first(false).set_last(true).set_free(true));
+        last_chunk.setup(ChunkMeta::empty().set_size(full_size - (size + CHUNK_ALLOC_METADATA_SIZE + CHUNK_METADATA_SIZE_ONE_SIDE)).set_first(false).set_last(true).set_free(true));
     } else {
         chunk_meta = chunk_meta.set_last(true);
     }
@@ -310,7 +356,7 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 #[inline]
 fn alloc_bucket(idx: usize) -> *mut u8 {
-    let alloc = map_memory(get_page_in_os_page_cnt()); // FIXME: align the allocated pages to PAGE_SIZE! (for this we will have to allocate 2 * PAGE_SIZE) pages and dealloc the trailing pages and unaligned pages at the beginning!
+    let alloc = map_pages(1); // FIXME: align the allocated pages to PAGE_SIZE! (for this we will have to allocate 2 * PAGE_SIZE) pages and dealloc the trailing pages and unaligned pages at the beginning!
     if alloc.is_null() {
         return alloc;
     }
@@ -355,8 +401,6 @@ fn dealloc_chunked(ptr: *mut u8) {
             unmap_memory(chunk.into_raw(), chunk.read_size());
             return;
         }
-        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE)) });
-        let alloc_size = alloc.read_chunked().read_size();
         let mut right_chunk = ChunkRef::new_start(chunk.into_end(chunk_size).into_raw());
         if !right_chunk.is_free() {
             println!("only free!");
@@ -366,8 +410,8 @@ fn dealloc_chunked(ptr: *mut u8) {
         }
         let overall_size = chunk_size + right_chunk.read_size();
         if right_chunk.is_last() {
-            println!("unmap {:?}", alloc.into_raw());
-            unmap_memory(alloc.into_raw().as_ptr(), alloc_size);
+            println!("unmap {:?}", ptr);
+            unsafe { unmap_memory(ptr.sub(ptr as usize % PAGE_SIZE), overall_size.next_multiple_of(PAGE_SIZE)); }
             return;
         }
         right_chunk.set_first(true); // FIXME: just update right metadata
@@ -377,18 +421,17 @@ fn dealloc_chunked(ptr: *mut u8) {
     }
     if chunk.is_last() {
         println!("last chunk!");
-        // FIXME: try merging with left chunk
-        let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk.into_raw().sub(ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE_ONE_SIDE)) });
-        let alloc_size = alloc.read_chunked().read_size();
-        let mut left_chunk = ChunkRef::new_end(unsafe { alloc.into_raw().as_ptr().sub(ALLOC_METADATA_SIZE_ONE_SIDE) });
+        let mut left_chunk = ChunkRef::new_end(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
         if !left_chunk.is_free() {
             // we can't merge with any other chunk, so we can just mark ourselves as free
             chunk.set_free(true);
             return;
         }
-        let overall_size = chunk_size + left_chunk.read_size();
-        if overall_size + ALLOC_METADATA_SIZE == alloc_size {
-            unmap_memory(alloc.into_raw().as_ptr(), alloc_size);
+        // FIXME: add threshold until which no chunk is created with empty memory (as it's just unnecessary bookkeeping)
+        // FIXME: can we get rid of the first_chunk and last_chunk indicators in the same step?
+        let overall_size = left_chunk.read_size() + chunk_size;
+        if left_chunk.is_first() /*left_chunk.0 as usize % PAGE_SIZE <= CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE*/ {
+            unsafe { unmap_memory(ptr.sub(ptr as usize % PAGE_SIZE), overall_size.next_multiple_of(PAGE_SIZE)); }
             return;
         }
         left_chunk.set_last(true); // FIXME: just update left metadata
@@ -396,7 +439,8 @@ fn dealloc_chunked(ptr: *mut u8) {
         chunk.update_size(overall_size); // FIXME: just update right metadata
         return;
     }
-    println!("weird chunk!");
+    // FIXME: support middle chunks!
+    todo!()
 }
 
 #[inline]
@@ -511,7 +555,7 @@ mod bit_map_list {
     /// # Design
     /// This is basically just a linked list of bitmaps that has links to the first and last node.
     /// New nodes will be appended to the end in order to allow the root node to be emptied of entries and as such
-    /// reduce fragmentation of the system and allow for more frequent deallocation of nodes at the tail (if the are empty).
+    /// reduce fragmentation of the system and allow for more frequent deallocation of nodes at the tail (if they are empty).
     #[derive(Default)]
     pub(crate) struct BitMapList {
         head: Option<NonNull<BitMapListNode>>,
@@ -599,22 +643,16 @@ mod bit_map_list {
     }
 
     pub(crate) struct BitMapListNode {
-        element_cnt: usize,
         next: *mut BitMapListNode,
         // FIXME: use one additional word as metadata (as we have to pad anyways)
     }
 
     impl BitMapListNode {
 
-        pub(crate) fn create(addr: *mut (), element_size: usize) -> NonNull<Self> {
+        pub(crate) fn create(addr: *mut (), element_size: usize, sub_maps: usize) -> NonNull<Self> {
             // FIXME: cache all these values for all used bucket sizes on startup
-            let max_elem_cnt = PAGE_SIZE / element_size;
-            let sub_maps = max_elem_cnt.div_ceil(usize::BITS as usize);
-            let meta = size_of::<usize>() + size_of::<BitMapListNode>() + sub_maps;
-            let elem_cnt = max_elem_cnt - meta.div_ceil(element_size);
             unsafe { addr.cast::<usize>().write(element_size); }
             unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode>().write(BitMapListNode {
-                element_cnt: elem_cnt,
                 next: null_mut(),
             }); }
             for i in 0..sub_maps {
