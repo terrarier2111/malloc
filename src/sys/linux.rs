@@ -9,11 +9,11 @@ use crate::chunk_ref::meta::ChunkMeta;
 use crate::chunk_ref::{CHUNK_METADATA_SIZE, ChunkRef, CHUNK_METADATA_SIZE_ONE_SIDE};
 use crate::util::{align_unaligned_ptr_up_to, round_up_to_multiple_of, abort};
 
-use self::bit_map_list::BitMapListNode;
+use self::bit_map_list::{BitMapListNode, BitMapList, BitMapEntry};
 use self::global_free_list::GlobalFreeList;
 use self::local_cache::ThreadLocalCache;
 
-use super::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE};
+use super::CACHE_LINE_WORD_SIZE;
 
 // FIXME: reuse allocations and maybe use sbrk
 
@@ -263,21 +263,36 @@ fn map_pages(pages: usize) -> *mut u8 {
     }
     let aligned = unsafe { align_unaligned_ptr_up_to(raw, size, PAGE_SIZE, pages * PAGE_SIZE) };
     let front = aligned as usize - raw as usize;
-    unmap_memory(raw, front);
+    if front != 0 {
+        unmap_memory(raw, front);
+    }
     let back = additional * PAGE_SIZE - front;
-    unmap_memory(unsafe { raw.add(pages * PAGE_SIZE) }, back);
+    if back != 0 {
+        unmap_memory(unsafe { raw.add(pages * PAGE_SIZE) }, back);
+    }
     aligned
 }
 
-/// returns memory aligned to word size
+/// returns memory chunk aligned to word size
 #[inline]
 pub fn alloc(size: usize) -> *mut u8 {
     if size > LARGEST_BUCKET {
         return alloc_chunked(size);
     }
     let bin_idx = bin_idx(size);
+    alloc_free_entry(bin_idx)
+}
+
+#[inline]
+fn bin_idx(size: usize) -> usize {
+    // FIXME: support bins in between larger powers of two that are themselves non-power of two bins.
+    let rounded_up = size.next_power_of_two();
+    (rounded_up.leading_zeros() - size_of::<usize>().leading_zeros()) as usize
+}
+
+fn alloc_free_entry(bin_idx: usize) -> *mut u8 {
     let bucket = &LOCAL_CACHE.buckets[bin_idx];
-    if let Some(entry) = bucket.alloc_free_entry() {
+    if let Some(entry) = bucket.try_alloc_free_entry() {
         return entry.into_raw().cast::<u8>().as_ptr();
     }
     // FIXME: reuse cached pages!
@@ -287,16 +302,9 @@ pub fn alloc(size: usize) -> *mut u8 {
         return alloc;
     }
     let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc)).read_bucket().into_start() };
-    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], e);
+    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], BUCKET_MAP_CNT[bin_idx]);
     bucket.insert_node(node);
-    bucket.alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
-}
-
-#[inline]
-fn bin_idx(size: usize) -> usize {
-    // FIXME: support bins in between larger powers of two that are themselves non-power of two bins.
-    let rounded_up = size.next_power_of_two();
-    (rounded_up.leading_zeros() - size_of::<usize>().leading_zeros()) as usize
+    bucket.try_alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
 }
 
 fn alloc_chunked(size: usize) -> *mut u8 {
@@ -328,13 +336,34 @@ fn alloc_chunked(size: usize) -> *mut u8 {
 #[inline]
 pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     let size = round_up_to_multiple_of(size, align_of::<usize>());
-    let full_size = round_up_to_multiple_of(size * 2 + ALLOC_FULL_INITIAL_METADATA_SIZE, PAGE_SIZE);
+    if align <= BUCKET_ELEM_SIZES[BUCKETS - 1] && size <= BUCKET_ELEM_SIZES[BUCKETS - 1] {
+        let bucket = bin_idx(size.max(align));
+        return alloc_free_entry(bucket);
+    }
+    alloc_large_alignment(size, align)
+}
+
+fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
+    let os_page_size = get_page_size();
+    let full_size = (round_up_to_multiple_of(size, os_page_size) + 2 * os_page_size).max(PAGE_SIZE * 2 + 2 * os_page_size);
+    let alloc_size = size.max(PAGE_SIZE);
     let alloc_ptr = map_memory(full_size);
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
-    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc_ptr) });
-    alloc.read_chunked().setup(full_size);
+    let aligned = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size, PAGE_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE + alloc_size) };
+    let front = aligned as usize - alloc_ptr as usize;
+    let trailing = full_size - (alloc_size + front);
+    if front != 0 {
+        // FIXME: currently we are unmapping 1 page too much!
+        unsafe { unmap_memory(alloc_ptr, front); }
+    }
+    if trailing != 0 {
+        unsafe { unmap_memory(aligned.add(alloc_size), trailing); }
+    }
+    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(aligned) });
+     // FIXME: if we want to retain parts of the allocation we might have to set last to false
+    alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_free(false).set_first(true).set_last(true));
     let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align, ALLOC_METADATA_SIZE_ONE_SIDE).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
     if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
         desired_chunk_start = unsafe { desired_chunk_start.add(size) };
@@ -592,7 +621,7 @@ mod bit_map_list {
             unsafe { old_tail.as_mut() }.next = node.as_ptr();
         }
 
-        pub fn alloc_free_entry(&mut self) -> Option<BitMapEntry> {
+        pub fn try_alloc_free_entry(&mut self) -> Option<BitMapEntry> {
             if self.head.is_none() {
                 return None;
             }
