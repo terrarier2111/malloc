@@ -1,4 +1,4 @@
-use std::{mem::size_of, ptr::NonNull};
+use std::{mem::size_of, ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}};
 
 use crate::{chunk_ref::{ChunkRef, meta::ChunkMeta}, util::align_unaligned_ptr_up_to};
 
@@ -18,8 +18,15 @@ const CHUNK_SIZE_MASK: usize = !CHUNK_METADATA_MASK;
 pub(crate) const BUCKET_METADATA_SIZE: usize = size_of::<usize>() * 2;
 
 const BUCKET_IDX_MASK: usize = 0b1111;
-const REMAINING_ELEM_CNT_MASK: usize = !(BUCKET_IDX_MASK | BUCKET_TY_FLAG); // we store a counter inside the bucket meta that just counts the local free slots as a fast path?
+const BUCKET_FREE_FLAG: usize = BUCKET_TY_FLAG >> 1;
+const REMAINING_ELEM_CNT_MASK: usize = !(BUCKET_IDX_MASK | BUCKET_FREE_FLAG | BUCKET_TY_FLAG); // we store a counter inside the bucket meta that just counts the local free slots as a fast path?
+const ELEM_CNT_SHIFT: usize = BUCKET_IDX_MASK.trailing_ones() as usize;
 
+// FIXME: rework element counting to use non-atomic updates when increments/decrements are done on the same thread (increments will always be done on the same thread)
+// FIXME: alternatively a simpler approach coult be taken to just have 2 seperate counters (an alloc and a dealloc one) and just comparing them if they are equal.
+// FIXME: As allocations can always be performed non-atomically we can eliminate half the atomic operations to figure out when to actually decomission the bucket we can
+// just compare the values of the alloc and dealloc counter and check if they are equal. also we don't have to care about overflows as this won't change the need
+// for both counters to overflow the same amount of times.
 #[derive(Clone, Copy)]
 pub struct BucketAlloc(NonNull<u8>);
 
@@ -37,18 +44,39 @@ impl BucketAlloc {
 
     #[inline]
     pub(crate) fn read_remaining_elem_cnt(self) -> usize {
-        (self.read_raw() & REMAINING_ELEM_CNT_MASK) >> BUCKET_IDX_MASK.leading_ones()
+        (self.read_raw() & REMAINING_ELEM_CNT_MASK) >> ELEM_CNT_SHIFT
     }
 
     #[inline]
     pub(crate) fn update_remaining_elem_cnt(self, elem_cnt: usize) {
-        self.write_raw(elem_cnt | (self.read_raw() & !REMAINING_ELEM_CNT_MASK))
+        self.write_raw((elem_cnt << ELEM_CNT_SHIFT) | (self.read_raw() & !REMAINING_ELEM_CNT_MASK))
     }
 
+    const CNT_ONE: usize = 1 << BUCKET_IDX_MASK.trailing_ones();
+
+    #[inline]
+    pub(crate) fn increase_remaining_elem_cnt(&self) -> ElementsInfo {
+        // FIXME: do we need a stronger ordering?
+        ElementsInfo(unsafe { AtomicUsize::from_ptr(self.0.as_ptr().cast::<usize>()) }.fetch_add(Self::CNT_ONE, std::sync::atomic::Ordering::Relaxed) + Self::CNT_ONE)
+    }
+
+    #[inline]
+    pub(crate) fn decrement_remaining_elem_cnt(&self, elements: usize) -> ElementsInfo {
+        // FIXME: do we need a stronger ordering?
+        ElementsInfo(unsafe { AtomicUsize::from_ptr(self.0.as_ptr().cast::<usize>()) }.fetch_sub(Self::CNT_ONE, std::sync::atomic::Ordering::Relaxed) - Self::CNT_ONE)
+    }
+
+    #[inline]
+    pub(crate) fn read_raw_atomic(&self, ordering: Ordering) -> ElementsInfo {
+        ElementsInfo(unsafe { self.0.as_ptr().cast::<AtomicUsize>().as_ref().unwrap_unchecked() }.load(ordering))
+    }
+
+    #[inline]
     fn setup(self, bucket_idx: usize) {
         self.write_raw(bucket_idx | BUCKET_TY_FLAG);
     }
 
+    #[inline]
     fn write_raw(mut self, val: usize) {
         unsafe { self.0.as_ptr().cast::<usize>().write(val); }
     }
@@ -61,6 +89,22 @@ impl BucketAlloc {
     #[inline]
     pub(crate) unsafe fn into_start(self) -> *mut u8 {
         self.0.as_ptr().add(BUCKET_METADATA_SIZE)
+    }
+
+}
+
+pub(crate) struct ElementsInfo(usize);
+
+impl ElementsInfo {
+
+    #[inline]
+    pub fn elem_cnt(&self) -> usize {
+        (self.0 & REMAINING_ELEM_CNT_MASK) >> ELEM_CNT_SHIFT
+    }
+
+    #[inline]
+    pub fn is_free(&self) -> bool {
+        self.0 & BUCKET_FREE_FLAG != 0
     }
 
 }

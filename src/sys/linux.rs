@@ -345,14 +345,17 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
     let os_page_size = get_page_size();
-    let full_size = (round_up_to_multiple_of(size, os_page_size) + 2 * os_page_size).max(PAGE_SIZE * 2 + 2 * os_page_size);
-    let alloc_size = size.max(PAGE_SIZE);
+    let base_size = size.max(align);
+    // allocate the space we need plus enough space to ensure we can align our allocation to PAGE_SIZE and additionally have 
+    let full_size = round_up_to_multiple_of(base_size, PAGE_SIZE) + 2 * PAGE_SIZE + 2 * os_page_size;
+    // keep multiples of PAGE_SIZE around so we can reuse these pages later on
+    let alloc_size = round_up_to_multiple_of(size, PAGE_SIZE);
     let alloc_ptr = map_memory(full_size);
     if alloc_ptr.is_null() {
         return alloc_ptr;
     }
-    let aligned = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size, PAGE_SIZE, CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE + alloc_size) };
-    let front = aligned as usize - alloc_ptr as usize;
+    let aligned = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size, PAGE_SIZE, alloc_size) };
+    let front = (aligned as usize - os_page_size) - alloc_ptr as usize;
     let trailing = full_size - (alloc_size + front);
     if front != 0 {
         // FIXME: currently we are unmapping 1 page too much!
@@ -361,7 +364,7 @@ fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
     if trailing != 0 {
         unsafe { unmap_memory(aligned.add(alloc_size), trailing); }
     }
-    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(aligned) });
+    let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(aligned.sub(CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE)) });
      // FIXME: if we want to retain parts of the allocation we might have to set last to false
     alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_free(false).set_first(true).set_last(true));
     let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align, ALLOC_METADATA_SIZE_ONE_SIDE).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
@@ -369,23 +372,22 @@ fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
         desired_chunk_start = unsafe { desired_chunk_start.add(size) };
     }
     let mut chunk = ChunkRef::new_start(desired_chunk_start);
-    chunk.setup(size, false, false);
+    chunk.setup(ChunkMeta::new(size, false, false, false));
     let mut first_chunk = ChunkRef::new_start(unsafe { alloc_ptr.add(ALLOC_METADATA_SIZE_ONE_SIDE) });
     let first_chunk_size = first_chunk.read_size();
-    first_chunk.setup(first_chunk_size, true, false);
-    first_chunk.set_free(true);
+    first_chunk.setup(ChunkMeta::new(first_chunk_size, true, false, true));
     let last_chunk_start = chunk.into_end(size).into_raw();
     let mut last_chunk = ChunkRef::new_start(last_chunk_start);
     let last_chunk_size = last_chunk.read_size();
-    last_chunk.setup(last_chunk_size, false, true);
-    last_chunk.set_free(true);
+    last_chunk.setup(ChunkMeta::new(last_chunk_size, false, true, true));
 
     chunk.into_content_start()
 }
 
 #[inline]
 fn alloc_bucket(idx: usize) -> *mut u8 {
-    let alloc = map_pages(1); // FIXME: align the allocated pages to PAGE_SIZE! (for this we will have to allocate 2 * PAGE_SIZE) pages and dealloc the trailing pages and unaligned pages at the beginning!
+    // allocate a new page aligned to PAGE_SIZE
+    let alloc = map_pages(1);
     if alloc.is_null() {
         return alloc;
     }
@@ -403,8 +405,18 @@ pub fn dealloc(ptr: *mut u8) {
     }
     let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(ptr) });
     if alloc.is_bucket() {
-        let alloc = alloc.read_bucket();
-        
+        let bucket = alloc.read_bucket();
+        let elems = bucket.read_raw_atomic(Ordering::Acquire);
+        let offset = ptr as usize % PAGE_SIZE;
+        let idx = (offset - BUCKET_META_AND_ELEM_CNTS.0[bucket.read_bucket_idx()]) / BUCKET_ELEM_SIZES[bucket.read_bucket_idx()];
+        let bucket_index = idx / PAGE_SIZE;
+        let bucket_inner_idx = idx % PAGE_SIZE;
+        unsafe { bucket.into_start().cast::<AtomicUsize>().add(bucket_index).as_ref().unwrap_unchecked().fetch_or(1 << bucket_inner_idx, Ordering::Relaxed); }
+        let elems = bucket.increase_remaining_elem_cnt();
+        if elems.is_free() && elems.elem_cnt() == BUCKET_META_AND_ELEM_CNTS.1[bucket.read_bucket_idx()] {
+            // FIXME: only push to local queue until a certain number of cache entries have been reached
+            unsafe { LOCAL_CACHE.push_free_chunk(alloc.into_raw().as_ptr().cast::<()>(), PAGE_SIZE); }
+        }
     } else {
         dealloc_chunked(ptr);
     }
@@ -417,6 +429,8 @@ fn dealloc_large(ptr: *mut u8) {
 }
 
 fn dealloc_chunked(ptr: *mut u8) {
+    let alloc_start = ptr as usize % PAGE_SIZE;
+    
     // FIXME: should we support multiple chunks in the same allocation?
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
