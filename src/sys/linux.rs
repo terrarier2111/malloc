@@ -62,6 +62,17 @@ fn free_global(addr: NonNull<u8>, size: usize) {
     unmap_memory(addr.as_ptr(), size);
 }
 
+const LOCAL_CACHE_ENTRIES_MAX: usize = 32;
+
+fn free_local(addr: NonNull<u8>, size: usize) {
+    let local = LOCAL_CACHE.free_chunk_root;
+    if local.len() >= LOCAL_CACHE_ENTRIES_MAX {
+        free_global(addr, size);
+        return;
+    }
+    unsafe { LOCAL_CACHE.push_free_chunk(addr.as_ptr().cast::<()>(), size); }
+}
+
 // Provides thread-local destructors without an associated "key", which
 // can be more efficient.
 
@@ -414,10 +425,10 @@ pub fn dealloc(ptr: *mut u8) {
         unsafe { bucket.into_start().cast::<AtomicUsize>().add(bucket_index).as_ref().unwrap_unchecked().fetch_or(1 << bucket_inner_idx, Ordering::Relaxed); }
         let elems = bucket.increase_remaining_elem_cnt();
         if elems.is_free() && elems.elem_cnt() == BUCKET_META_AND_ELEM_CNTS.1[bucket.read_bucket_idx()] {
-            // FIXME: only push to local queue until a certain number of cache entries have been reached
-            unsafe { LOCAL_CACHE.push_free_chunk(alloc.into_raw().as_ptr().cast::<()>(), PAGE_SIZE); }
+            free_local(alloc.into_raw(), PAGE_SIZE);
         }
     } else {
+        println!("deallocating chunk");
         dealloc_chunked(ptr);
     }
 }
@@ -441,7 +452,7 @@ fn dealloc_chunked(ptr: *mut u8) {
         if chunk.is_last() {
             // we are the only chunk, so just cleanup
             println!("unmap {:?}", chunk.into_raw());
-            unmap_memory(chunk.into_raw(), chunk.read_size());
+            free_local(unsafe { NonNull::new_unchecked(chunk.into_raw()) }, chunk.read_size());
             return;
         }
         let mut right_chunk = ChunkRef::new_start(chunk.into_end(chunk_size).into_raw());
@@ -457,9 +468,9 @@ fn dealloc_chunked(ptr: *mut u8) {
             unsafe { unmap_memory(ptr.sub(ptr as usize % PAGE_SIZE), overall_size.next_multiple_of(PAGE_SIZE)); }
             return;
         }
-        right_chunk.set_first(true); // FIXME: just update right metadata
-        right_chunk.update_size(overall_size); // FIXME: just update right metadata
-        chunk.update_size(overall_size); // FIXME: just update left metadata
+        right_chunk.set_first(true);
+        right_chunk.update_size(overall_size);
+        chunk.update_size(overall_size);
         return;
     }
     if chunk.is_last() {
@@ -473,13 +484,9 @@ fn dealloc_chunked(ptr: *mut u8) {
         // FIXME: add threshold until which no chunk is created with empty memory (as it's just unnecessary bookkeeping)
         // FIXME: can we get rid of the first_chunk and last_chunk indicators in the same step?
         let overall_size = left_chunk.read_size() + chunk_size;
-        if left_chunk.is_first() /*left_chunk.0 as usize % PAGE_SIZE <= CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE*/ {
-            unsafe { unmap_memory(ptr.sub(ptr as usize % PAGE_SIZE), overall_size.next_multiple_of(PAGE_SIZE)); }
-            return;
-        }
-        left_chunk.set_last(true); // FIXME: just update left metadata
-        left_chunk.update_size(overall_size); // FIXME: just update left metadata
-        chunk.update_size(overall_size); // FIXME: just update right metadata
+        left_chunk.set_last(true);
+        left_chunk.update_size(overall_size);
+        chunk.update_size(overall_size);
         return;
     }
     // FIXME: support middle chunks!
@@ -709,7 +716,7 @@ mod bit_map_list {
             // [entries, bitmaps, leaf tip, metadata]
             let curr = self as *mut BitMapListNode as *mut ();
             // FIXME: can we get rid of this div_ceil - we could by caching!
-            let bitmap_cnt = self.element_cnt.div_ceil(usize::BITS as usize);
+            let bitmap_cnt = self.element_cnt().div_ceil(usize::BITS as usize);
             // traverse the map backwards to allow for the possibility that we don't have to fetch
             // another cache line if we are lucky
             let end = unsafe { curr.cast::<usize>().sub(1) };
@@ -726,6 +733,12 @@ mod bit_map_list {
                 }
             }
             None
+        }
+
+        #[inline]
+        fn element_cnt(&self) -> usize {
+            let curr = self as *const BitMapListNode as *mut ();
+            unsafe { *curr.cast::<usize>() }
         }
 
     }
