@@ -362,8 +362,9 @@ fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
     // keep multiples of PAGE_SIZE around so we can reuse these pages later on
     let alloc_size = round_up_to_multiple_of(size, PAGE_SIZE);
     let alloc_ptr = map_memory(full_size);
+    // handle mapping errors
     if alloc_ptr.is_null() {
-        return alloc_ptr;
+        return null_mut();
     }
     let aligned = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size, PAGE_SIZE, alloc_size) };
     let front = (aligned as usize - os_page_size) - alloc_ptr as usize;
@@ -378,13 +379,9 @@ fn alloc_large_alignment(align: usize, size: usize) -> *mut u8 {
     let mut alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(aligned.sub(CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE)) });
      // FIXME: if we want to retain parts of the allocation we might have to set last to false
     alloc.read_chunked().setup(ChunkMeta::empty().set_size(full_size).set_free(false).set_first(true).set_last(true));
-    let mut desired_chunk_start = unsafe { align_unaligned_ptr_up_to(alloc_ptr, full_size - ALLOC_METADATA_SIZE_ONE_SIDE, align, ALLOC_METADATA_SIZE_ONE_SIDE).sub(ALLOC_METADATA_SIZE_ONE_SIDE) };
-    if (desired_chunk_start as usize - alloc_ptr as usize) < ALLOC_METADATA_SIZE_ONE_SIDE + CHUNK_METADATA_SIZE {
-        desired_chunk_start = unsafe { desired_chunk_start.add(size) };
-    }
-    let mut chunk = ChunkRef::new_start(desired_chunk_start);
+    let mut chunk = ChunkRef::new_start(aligned);
     chunk.setup(ChunkMeta::new(size, false, false, false));
-    let mut first_chunk = ChunkRef::new_start(unsafe { alloc_ptr.add(ALLOC_METADATA_SIZE_ONE_SIDE) });
+    let mut first_chunk = ChunkRef::new_start(unsafe { alloc_ptr.add(CHUNK_ALLOC_METADATA_SIZE_ONE_SIDE) });
     let first_chunk_size = first_chunk.read_size();
     first_chunk.setup(ChunkMeta::new(first_chunk_size, true, false, true));
     let last_chunk_start = chunk.into_end(size).into_raw();
