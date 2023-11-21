@@ -1,6 +1,7 @@
 use core::arch::asm;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
 use std::mem::{align_of, size_of};
 use std::ptr::{null_mut, NonNull};
 use libc::{_SC_PAGESIZE, c_int, MAP_ANON, MAP_PRIVATE, off64_t, PROT_READ, PROT_WRITE, size_t, sysconf};
@@ -65,12 +66,12 @@ fn free_global(addr: NonNull<u8>, size: usize) {
 const LOCAL_CACHE_ENTRIES_MAX: usize = 32;
 
 fn free_local(addr: NonNull<u8>, size: usize) {
-    let local = LOCAL_CACHE.free_chunk_root;
-    if local.len() >= LOCAL_CACHE_ENTRIES_MAX {
+    let local = LOCAL_CACHE.get();
+    if unsafe { &mut *local }.free_chunk_root.len() >= LOCAL_CACHE_ENTRIES_MAX {
         free_global(addr, size);
         return;
     }
-    unsafe { LOCAL_CACHE.push_free_chunk(addr.as_ptr().cast::<()>(), size); }
+    unsafe { (&mut *local).push_free_chunk(addr.as_ptr().cast::<()>(), size); }
 }
 
 // Provides thread-local destructors without an associated "key", which
@@ -110,7 +111,7 @@ pub(crate) unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern "C" fn(*mut u
 }
 
 #[thread_local]
-static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
+static LOCAL_CACHE: UnsafeCell<ThreadLocalCache> = UnsafeCell::new(ThreadLocalCache::new());
 
 fn cleanup_tls() {
     // we store the metadata about the size and next ptr in the allocations themselves
@@ -118,7 +119,7 @@ fn cleanup_tls() {
     // it but we don't have to use as much memory. We have to load 24 bytes (on 64 bit systems)
     // anyways as we have 2 ptrs to children and one key for traversal.
     // FIXME: is this tradeoff worth it?
-    let mut chunk_ref = unsafe { LOCAL_CACHE.free_chunk_root.pop_front().cast::<FreeAlloc>() };
+    let mut chunk_ref = unsafe { (&mut *LOCAL_CACHE.get()).free_chunk_root.pop_front().cast::<FreeAlloc>() };
     while !chunk_ref.is_null() {
         let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(chunk_ref.cast::<u8>()) });
         let size = alloc.read_free().read_size()/* / PAGE_SIZE*/;
@@ -264,23 +265,27 @@ fn map_pages(pages: usize) -> *mut u8 {
     let (size, additional) = if pages == 1 {
         (2 * PAGE_SIZE, 1)
     } else {
-        (pages + 2 * PAGE_SIZE, 2)
+        ((pages + 2) * PAGE_SIZE, 2)
     };
     let raw = map_memory(size);
+    println!("mapped 0");
     // FIXME: is this fast path actually an improvement?
     if raw as usize % PAGE_SIZE == 0 {
-        unsafe { LOCAL_CACHE.push_free_chunk(raw.add(pages * PAGE_SIZE).cast::<()>(), additional * PAGE_SIZE); }
+        unsafe { (&mut *LOCAL_CACHE.get()).push_free_chunk(raw.add(pages * PAGE_SIZE).cast::<()>(), additional * PAGE_SIZE); }
         return raw;
     }
     let aligned = unsafe { align_unaligned_ptr_up_to(raw, size, PAGE_SIZE, pages * PAGE_SIZE) };
     let front = aligned as usize - raw as usize;
     if front != 0 {
+        println!("unmapping {front}");
         unmap_memory(raw, front);
     }
     let back = additional * PAGE_SIZE - front;
     if back != 0 {
-        unmap_memory(unsafe { raw.add(pages * PAGE_SIZE) }, back);
+        println!("unmapping {back}");
+        unmap_memory(unsafe { raw.add(front + pages * PAGE_SIZE) }, back);
     }
+    println!("allocec raw: {:?} aligned: {:?}", raw as usize, aligned as usize);
     aligned
 }
 
@@ -291,6 +296,7 @@ pub fn alloc(size: usize) -> *mut u8 {
         return alloc_chunked(size);
     }
     let bin_idx = bin_idx(size);
+    println!("bin: {}", bin_idx);
     alloc_free_entry(bin_idx)
 }
 
@@ -298,24 +304,32 @@ pub fn alloc(size: usize) -> *mut u8 {
 fn bin_idx(size: usize) -> usize {
     // FIXME: support bins in between larger powers of two that are themselves non-power of two bins.
     let rounded_up = size.next_power_of_two();
-    (rounded_up.leading_zeros() - size_of::<usize>().leading_zeros()) as usize
+    (rounded_up.trailing_zeros() - size_of::<usize>().trailing_zeros()) as usize
 }
 
 fn alloc_free_entry(bin_idx: usize) -> *mut u8 {
-    let bucket = &LOCAL_CACHE.buckets[bin_idx];
+    let bucket = unsafe { &mut (&mut *LOCAL_CACHE.get()).buckets[bin_idx] };
     if let Some(entry) = bucket.try_alloc_free_entry() {
+        println!("quickly got entry");
         return entry.into_raw().cast::<u8>().as_ptr();
     }
     // FIXME: reuse cached pages!
 
-    let alloc = alloc_bucket(bin_idx);
-    if alloc.is_null() {
-        return alloc;
+    println!("allocating bucket");
+    let alloc_0 = alloc_bucket(bin_idx);
+    println!("alloced new bucket {}", unsafe { *alloc_0.cast::<usize>() });
+    if alloc_0.is_null() {
+        return alloc_0;
     }
-    let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc)).read_bucket().into_start() };
+    assert!(unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc_0)).is_bucket() });
+    let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc_0)).read_bucket().into_start() };
     let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], BUCKET_MAP_CNT[bin_idx]);
     bucket.insert_node(node);
-    bucket.try_alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut())
+    println!("inserted node {}", node.as_ptr() as usize);
+    let ret = bucket.try_alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut());
+    assert!(unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc_0)).is_bucket() });
+    println!("ret: {:?}", ret);
+    ret
 }
 
 fn alloc_chunked(size: usize) -> *mut u8 {
@@ -399,6 +413,7 @@ fn alloc_bucket(idx: usize) -> *mut u8 {
     if alloc.is_null() {
         return alloc;
     }
+    println!("mapped {}", alloc as usize % PAGE_SIZE);
     AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc) }).setup_bucket(idx);
     alloc
 }
@@ -411,10 +426,10 @@ pub fn dealloc(ptr: *mut u8) {
         dealloc_large(ptr);
         return;
     }
-    let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(ptr) });
+    println!("val: {}, {}", unsafe { *(((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) as *mut u8) }, ((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) % PAGE_SIZE);
+    let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) as *mut u8) });
     if alloc.is_bucket() {
         let bucket = alloc.read_bucket();
-        let elems = bucket.read_raw_atomic(Ordering::Acquire);
         let offset = ptr as usize % PAGE_SIZE;
         let idx = (offset - BUCKET_META_AND_ELEM_CNTS.0[bucket.read_bucket_idx()]) / BUCKET_ELEM_SIZES[bucket.read_bucket_idx()];
         let bucket_index = idx / PAGE_SIZE;
@@ -436,9 +451,7 @@ fn dealloc_large(ptr: *mut u8) {
     dealloc_chunked(ptr);
 }
 
-fn dealloc_chunked(ptr: *mut u8) {
-    let alloc_start = ptr as usize % PAGE_SIZE;
-    
+fn dealloc_chunked(ptr: *mut u8) {   
     // FIXME: should we support multiple chunks in the same allocation?
     let mut chunk = ChunkRef::new_start(unsafe { ptr.sub(CHUNK_METADATA_SIZE_ONE_SIDE) });
     let chunk_size = chunk.read_size();
@@ -462,11 +475,9 @@ fn dealloc_chunked(ptr: *mut u8) {
         let overall_size = chunk_size + right_chunk.read_size();
         if right_chunk.is_last() {
             println!("unmap {:?}", ptr);
-            unsafe { unmap_memory(ptr.sub(ptr as usize % PAGE_SIZE), overall_size.next_multiple_of(PAGE_SIZE)); }
+            free_local(unsafe { NonNull::new_unchecked(chunk.into_raw()) }, overall_size.next_multiple_of(PAGE_SIZE));
             return;
         }
-        right_chunk.set_first(true);
-        right_chunk.update_size(overall_size);
         chunk.update_size(overall_size);
         return;
     }
@@ -483,7 +494,6 @@ fn dealloc_chunked(ptr: *mut u8) {
         let overall_size = left_chunk.read_size() + chunk_size;
         left_chunk.set_last(true);
         left_chunk.update_size(overall_size);
-        chunk.update_size(overall_size);
         return;
     }
     // FIXME: support middle chunks!
@@ -495,7 +505,7 @@ pub fn realloc(ptr: *mut u8, old_size: usize, new_size: usize, _new_align: usize
     remap_memory(ptr, old_size, new_size)
 }
 
-#[cfg(not(miri))]
+/*#[cfg(not(miri))]
 #[inline]
 fn map_memory(size: usize) -> *mut u8 {
     const MMAP_SYSCALL_ID: usize = 9;
@@ -511,14 +521,16 @@ fn map_memory(size: usize) -> *mut u8 {
             in("r10") MAP_ANON | MAP_PRIVATE,
             in("r8") -1 as c_int,
             in("r9") 0 as off64_t,
-            inlateout("rax") MMAP_SYSCALL_ID => ptr,
+            // inlateout("rax") MMAP_SYSCALL_ID => ptr,
+            in("rax") MMAP_SYSCALL_ID,
+            lateout("rax") ptr,
             lateout("rdx") _,
         );
     }
     ptr
-}
+}*/
 
-#[cfg(miri)]
+// #[cfg(miri)]
 fn map_memory(size: usize) -> *mut u8 {
     use libc::mmap;
 
@@ -563,7 +575,7 @@ fn unmap_memory(ptr: *mut u8, size: usize) {
 
 #[cfg(miri)]
 fn remap_memory(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
-    use libc::mremap;
+    use libc::{mremap, MREMAP_MAYMOVE};
 
     unsafe { mremap(ptr.cast::<c_void>(), old_size, new_size, MREMAP_MAYMOVE) }.cast::<u8>() // FIXME: can we handle return value?
 }
@@ -623,7 +635,7 @@ mod bit_map_list {
             }
         }
 
-        pub fn insert_node(&mut self, mut node: NonNull<BitMapListNode>) {
+        pub fn insert_node(&mut self, node: NonNull<BitMapListNode>) {
             self.entries += 1;
             if self.head.is_none() {
                 self.head = Some(node);
@@ -643,12 +655,17 @@ mod bit_map_list {
             if self.head.is_none() {
                 return None;
             }
-            let ret = unsafe { self.head.unwrap_unchecked().as_mut() }.alloc_free_entry();
+            println!("checked head!");
+            let mut ret = unsafe { self.head.unwrap_unchecked().as_mut() }.alloc_free_entry();
+            println!("ret: {:?}", ret.map(|entry| entry.ptr.as_ptr()));
             if ret.is_none() {
                 // get rid of old entry
                 self.entries -= 1;
                 self.head = NonNull::new(unsafe { self.head.unwrap_unchecked().as_ref().next });
+                ret = unsafe { self.head.unwrap_unchecked().as_mut() }.alloc_free_entry();
+                println!("replaced!");
             }
+            println!("ret: {:?}", ret.map(|entry| entry.ptr.as_ptr()));          
             ret
         }
 
@@ -697,13 +714,14 @@ mod bit_map_list {
     impl BitMapListNode {
 
         pub(crate) fn create(addr: *mut (), element_size: usize, sub_maps: usize) -> NonNull<Self> {
+            println!("addr {} size: {}", addr as usize,element_size);
             // FIXME: cache all these values for all used bucket sizes on startup
             unsafe { addr.cast::<usize>().write(element_size); }
             unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode>().write(BitMapListNode {
                 next: null_mut(),
             }); }
             for i in 0..sub_maps {
-                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + size_of::<usize>() * i).write(0); }
+                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + size_of::<usize>() * i).write(u8::MAX); }
             }
             unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode>()) }
         }
@@ -712,12 +730,15 @@ mod bit_map_list {
             // assume that we are inside the allocation page, such a page looks something like this:
             // [entries, bitmaps, leaf tip, metadata]
             let curr = self as *mut BitMapListNode as *mut ();
+            println!("checking {}", curr as usize);
             // FIXME: can we get rid of this div_ceil - we could by caching!
-            let bitmap_cnt = self.element_cnt().div_ceil(usize::BITS as usize);
+            let bitmap_cnt = (PAGE_SIZE / self.element_size()).div_ceil(usize::BITS as usize).max(1);
             // traverse the map backwards to allow for the possibility that we don't have to fetch
             // another cache line if we are lucky
-            let end = unsafe { curr.cast::<usize>().sub(1) };
+            println!("pre checking maps!");
+            let end = unsafe { curr.cast::<usize>().add(bitmap_cnt) };
             for i in 0..bitmap_cnt {
+                println!("check map!");
                 let map_ptr = unsafe { end.sub(i) };
                 let map = unsafe { *map_ptr };
                 let idx = map.trailing_zeros() as usize;
@@ -733,9 +754,9 @@ mod bit_map_list {
         }
 
         #[inline]
-        fn element_cnt(&self) -> usize {
+        fn element_size(&self) -> usize {
             let curr = self as *const BitMapListNode as *mut ();
-            unsafe { *curr.cast::<usize>() }
+            unsafe { *curr.cast::<usize>().sub(1) }
         }
 
     }

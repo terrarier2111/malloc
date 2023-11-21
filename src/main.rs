@@ -4,15 +4,16 @@
 #![feature(int_roundings)]
 #![feature(thread_local)]
 
-use allocator::{alloc, dealloc};
+use allocator::{alloc, free};
 
-mod linux;
 mod util;
 
 fn main() {
     println!("main!");
     let alloced = alloc(20);
+    unsafe { *alloced = 9; }
+    assert_eq!(unsafe { *alloced }, 9);
     println!("errno: {}", errno::errno());
     println!("alloc: {:?}", alloced);
-    dealloc(alloced);
+    free(alloced);
 }
