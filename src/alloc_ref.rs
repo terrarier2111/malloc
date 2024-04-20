@@ -79,6 +79,7 @@ impl BucketAlloc {
     #[inline]
     fn write_raw(mut self, val: usize) {
         unsafe { self.0.as_ptr().cast::<usize>().write(val); }
+        println!("write {} to {}", val, self.0.as_ptr() as usize);
     }
 
     #[inline]

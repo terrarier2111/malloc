@@ -186,8 +186,8 @@ mod local_cache {
     }
 }
 
-const BUCKETS: usize = 10;
-const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+const BUCKETS: usize = 12;
+const BUCKET_ELEM_SIZES: [usize; BUCKETS] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
 // the first array is for meta size and the second is for elem cnt
 const BUCKET_META_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
@@ -222,6 +222,19 @@ const BUCKET_MAP_CNT: [usize; BUCKETS] = {
     let mut i = 0;
     while i < BUCKETS {
         ret[i] = (BUCKET_META_AND_ELEM_CNTS.0[i] - meta_base_word_size) / 2;
+        i += 1;
+    }
+    ret
+};
+
+// how many entries are 
+const META_ENTRIES_USED: [usize; BUCKETS] = {
+    let mut ret = [0; BUCKETS];
+    let meta_base_word_size: usize = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
+    let mut i = 0;
+    while i < BUCKETS {
+        ret[i] = (BUCKET_META_AND_ELEM_CNTS.0[i] - meta_base_word_size).div_ceil(BUCKET_ELEM_SIZES[i]);
+        // static_assertions::const_assert_eq!(ret[i], BUCKET_ELEM_SIZES[i] - BUCKET_META_AND_ELEM_CNTS.1[i]); // FIXME: assert this correctly!
         i += 1;
     }
     ret
@@ -323,7 +336,7 @@ fn alloc_free_entry(bin_idx: usize) -> *mut u8 {
     }
     assert!(unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc_0)).is_bucket() });
     let alloc = unsafe { AllocRef::new_start(NonNull::new_unchecked(alloc_0)).read_bucket().into_start() };
-    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], BUCKET_MAP_CNT[bin_idx]);
+    let node = BitMapListNode::create(alloc.cast::<()>(), BUCKET_ELEM_SIZES[bin_idx], BUCKET_MAP_CNT[bin_idx], META_ENTRIES_USED[bin_idx]);
     bucket.insert_node(node);
     println!("inserted node {}", node.as_ptr() as usize);
     let ret = bucket.try_alloc_free_entry().map(|entry| entry.into_raw().as_ptr().cast::<u8>()).unwrap_or(null_mut());
@@ -413,7 +426,7 @@ fn alloc_bucket(idx: usize) -> *mut u8 {
     if alloc.is_null() {
         return alloc;
     }
-    println!("mapped {}", alloc as usize % PAGE_SIZE);
+    println!("raw: {} mapped {} idx {}", alloc as usize, alloc as usize % PAGE_SIZE, idx);
     AllocRef::new_start(unsafe { NonNull::new_unchecked(alloc) }).setup_bucket(idx);
     alloc
 }
@@ -428,20 +441,17 @@ pub fn dealloc(ptr: *mut u8) {
     }
     println!("val: {}, {}", unsafe { *(((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) as *mut u8) }, ((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) % PAGE_SIZE);
     let alloc = AllocRef::new_start(unsafe { NonNull::new_unchecked(((ptr as usize) - ((ptr as usize) % PAGE_SIZE)) as *mut u8) });
-    if alloc.is_bucket() {
-        let bucket = alloc.read_bucket();
-        let offset = ptr as usize % PAGE_SIZE;
-        let idx = (offset - BUCKET_META_AND_ELEM_CNTS.0[bucket.read_bucket_idx()]) / BUCKET_ELEM_SIZES[bucket.read_bucket_idx()];
-        let bucket_index = idx / PAGE_SIZE;
-        let bucket_inner_idx = idx % PAGE_SIZE;
-        unsafe { bucket.into_start().cast::<AtomicUsize>().add(bucket_index).as_ref().unwrap_unchecked().fetch_or(1 << bucket_inner_idx, Ordering::Relaxed); }
-        let elems = bucket.increase_remaining_elem_cnt();
-        if elems.is_free() && elems.elem_cnt() == BUCKET_META_AND_ELEM_CNTS.1[bucket.read_bucket_idx()] {
-            free_local(alloc.into_raw(), PAGE_SIZE);
-        }
-    } else {
-        println!("deallocating chunk");
-        dealloc_chunked(ptr);
+    let bucket = alloc.read_bucket();
+    println!("bucket: {}", bucket.read_bucket_idx());
+    let offset = ptr as usize % PAGE_SIZE; // FIXME: this offset is to small as it doesn't respect the map metadata
+    let idx = (offset - BUCKET_META_AND_ELEM_CNTS.0[bucket.read_bucket_idx()]) / BUCKET_ELEM_SIZES[bucket.read_bucket_idx()];
+    let bucket_index = idx / PAGE_SIZE;
+    let bucket_inner_idx = idx % PAGE_SIZE;
+    println!("offset: {} idx: {} bucket_idx: {} bucket_inner_idx: {}", offset, idx, bucket_index, bucket_inner_idx);
+    unsafe { bucket.into_start().cast::<AtomicUsize>().add(bucket_index).as_ref().unwrap_unchecked().fetch_or(1 << bucket_inner_idx, Ordering::Release); }
+    let elems = bucket.increase_remaining_elem_cnt();
+    if elems.is_free() && elems.elem_cnt() == BUCKET_META_AND_ELEM_CNTS.1[bucket.read_bucket_idx()] {
+        free_local(alloc.into_raw(), PAGE_SIZE);
     }
 }
 
@@ -604,6 +614,7 @@ mod bit_map_list {
     use std::mem::size_of;
     use std::ptr::{NonNull, null_mut};
 
+    use crate::sys::linux::META_ENTRIES_USED;
     use crate::sys::{CACHE_LINE_SIZE, CACHE_LINE_WORD_SIZE, get_page_size};
     use crate::util::min;
 
@@ -713,16 +724,20 @@ mod bit_map_list {
 
     impl BitMapListNode {
 
-        pub(crate) fn create(addr: *mut (), element_size: usize, sub_maps: usize) -> NonNull<Self> {
-            println!("addr {} size: {}", addr as usize,element_size);
+        pub(crate) fn create(addr: *mut (), element_size: usize, sub_maps: usize, entries_used: usize) -> NonNull<Self> {
+            println!("addr {} size: {}", addr as usize, element_size);
             // FIXME: cache all these values for all used bucket sizes on startup
             unsafe { addr.cast::<usize>().write(element_size); }
             unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode>().write(BitMapListNode {
                 next: null_mut(),
             }); }
-            for i in 0..sub_maps {
-                unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + size_of::<usize>() * i).write(u8::MAX); }
-            }
+            // mark all the filled nodes as used
+            let full_sub_map_bytes = entries_used.div_floor(u8::BITS as usize);
+            unsafe { core::ptr::write_bytes(addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>()), u8::MAX, full_sub_map_bytes); }
+            // deal with the last partially filled (or empty, doesn't matter) bitset and fill it as required
+            let remaining = entries_used - full_sub_map_bytes * (u8::BITS as usize);
+            let bit_set = (1 << (remaining + 1)) - 1;
+            unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + full_sub_map_bytes).write(bit_set); }
             unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode>()) }
         }
 

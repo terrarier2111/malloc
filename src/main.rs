@@ -3,6 +3,7 @@
 #![feature(strict_provenance)]
 #![feature(int_roundings)]
 #![feature(thread_local)]
+#![feature(const_intrinsic_copy)]
 
 use allocator::{alloc, free};
 

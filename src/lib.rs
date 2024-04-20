@@ -6,7 +6,7 @@
 #![feature(ptr_mask)]
 #![feature(int_roundings)]
 #![feature(linkage)]
-#![feature(atomic_from_ptr)]
+#![feature(const_intrinsic_copy)]
 
 mod util;
 mod sys;
