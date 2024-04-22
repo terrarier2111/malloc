@@ -192,7 +192,7 @@ const LARGEST_BUCKET: usize = BUCKET_ELEM_SIZES[BUCKETS - 1];
 // the first array is for meta size and the second is for elem cnt
 const BUCKET_META_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
     let mut ret = ([0; BUCKETS], [0; BUCKETS]);
-    let meta_base_word_size = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
+    const META_BASE_WORD_SIZE: usize = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
     let mut i = 0;
     while i < BUCKETS {
         // calculate bucket size by first estimating the meta size and then
@@ -200,7 +200,7 @@ const BUCKET_META_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
         let mut max_elems = PAGE_SIZE / BUCKET_ELEM_SIZES[i];
         // our metadata consists of a bitmap of used values and another atomic bitmap, which has to be aligned to cache line size.
         const BUCKET_META_WORD_SIZE: usize = BUCKET_METADATA_SIZE.div_ceil(size_of::<usize>());
-        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + meta_base_word_size).next_multiple_of(CACHE_LINE_WORD_SIZE);
+        let mut meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + META_BASE_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
         loop {
             let prev = max_elems;
             max_elems = (PAGE_SIZE - meta_size * size_of::<usize>()) / BUCKET_ELEM_SIZES[i];
@@ -208,7 +208,7 @@ const BUCKET_META_AND_ELEM_CNTS: ([usize; BUCKETS], [usize; BUCKETS]) = {
             if prev == max_elems {
                 break;
             }
-            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + meta_base_word_size).next_multiple_of(CACHE_LINE_WORD_SIZE);
+            meta_size = (max_elems.div_ceil(usize::BITS as usize) * 2 + BUCKET_META_WORD_SIZE + META_BASE_WORD_SIZE).next_multiple_of(CACHE_LINE_WORD_SIZE);
         }
         ret.0[i] = meta_size - BUCKET_META_WORD_SIZE;
         ret.1[i] = max_elems;
@@ -227,13 +227,13 @@ const BUCKET_MAP_CNT: [usize; BUCKETS] = {
     ret
 };
 
-// how many entries are 
+// how many entries are used to store metadata
 const META_ENTRIES_USED: [usize; BUCKETS] = {
     let mut ret = [0; BUCKETS];
-    let meta_base_word_size: usize = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
+    const META_BASE_WORD_SIZE: usize = (size_of::<usize>() + size_of::<BitMapListNode>()).div_ceil(size_of::<usize>());
     let mut i = 0;
     while i < BUCKETS {
-        ret[i] = (BUCKET_META_AND_ELEM_CNTS.0[i] - meta_base_word_size).div_ceil(BUCKET_ELEM_SIZES[i]);
+        ret[i] = (BUCKET_META_AND_ELEM_CNTS.0[i] - META_BASE_WORD_SIZE).div_ceil(BUCKET_ELEM_SIZES[i].div_floor(size_of::<usize>()));
         // static_assertions::const_assert_eq!(ret[i], BUCKET_ELEM_SIZES[i] - BUCKET_META_AND_ELEM_CNTS.1[i]); // FIXME: assert this correctly!
         i += 1;
     }
@@ -731,13 +731,18 @@ mod bit_map_list {
             unsafe { addr.cast::<usize>().add(1).cast::<BitMapListNode>().write(BitMapListNode {
                 next: null_mut(),
             }); }
+            println!("used entries: {}", entries_used);
             // mark all the filled nodes as used
             let full_sub_map_bytes = entries_used.div_floor(u8::BITS as usize);
+            println!("map bytes: {}", full_sub_map_bytes);
             unsafe { core::ptr::write_bytes(addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>()), u8::MAX, full_sub_map_bytes); }
             // deal with the last partially filled (or empty, doesn't matter) bitset and fill it as required
             let remaining = entries_used - full_sub_map_bytes * (u8::BITS as usize);
             let bit_set = (1 << (remaining + 1)) - 1;
             unsafe { addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + full_sub_map_bytes).write(bit_set); }
+            // clear the remaining bitmaps to make sure that we indicate that they are usable
+            let remaining_bytes = (sub_maps * size_of::<usize>()) - full_sub_map_bytes - 1;
+            unsafe { core::ptr::write_bytes(addr.cast::<u8>().add(size_of::<usize>() + size_of::<BitMapListNode>() + full_sub_map_bytes + 1), 0, remaining_bytes); }
             unsafe { NonNull::new_unchecked(addr.cast::<usize>().add(1).cast::<BitMapListNode>()) }
         }
 
@@ -781,14 +786,14 @@ mod bit_map_list {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
+    unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, nomem, preserves_flags)); }
     res
 }
 
 #[cfg(all(target_arch = "x86", target_os = "linux"))]
 fn thread_identifier() -> usize {
     let res;
-    unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
+    unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, nomem, preserves_flags)); }
     res
 }
 
